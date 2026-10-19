@@ -1,27 +1,3 @@
-// 切换背景面板显示/隐藏
-function toggleVentPanel() {
-  const panel = document.getElementById("ventPanel");
-  if(panel.getAttribute('aria-hidden') === "true"){
-    panel.setAttribute('aria-hidden',"false");
-  }else{
-    panel.setAttribute('aria-hidden',"true");
-  }
-}
-
-// 加载本地保存的宣泄对象与背景
-const savedTarget = localStorage.getItem("ventTarget");
-const savedBio = localStorage.getItem("ventBio");
-if(savedTarget) document.getElementById("ventTarget").value = savedTarget;
-if(savedBio) document.getElementById("ventBio").value = savedBio;
-
-// 输入内容自动保存到本地
-document.getElementById("ventTarget").addEventListener("input",e=>{
-  localStorage.setItem("ventTarget",e.target.value);
-})
-document.getElementById("ventBio").addEventListener("input",e=>{
-  localStorage.setItem("ventBio",e.target.value);
-})
-
 /* =========================================================
    决策辩论助手 / js/main.js
    ---------------------------------------------------------
@@ -56,6 +32,10 @@ const SYSTEM_PROMPT = `你是一个真人辩手, 坐在我对面, 我们正在�
 绝对不要分点罗列, 不许出现 第一 第二 第三, 不许用 首先 其次 最后 做排比,
 不要写小标题, 不要结论式总结, 也不要说 希望对你有帮助 或者 你怎么看 这类客套话.
 一次说三四段话就够了, 说完就停, 把话头留给我.`;
+
+/* [新增] 最终提示词: 在原始 SYSTEM_PROMPT 之上追加宣泄对象背景,
+   原始 SYSTEM_PROMPT 文本一行都不改, 只新增这个变量 */
+let finalPrompt = SYSTEM_PROMPT;
 
 const STORAGE_KEY = "harness_debate_session";
 const THEME_KEY = "harness_debate_theme";
@@ -364,7 +344,7 @@ function loadSession() {
       const parsed = JSON.parse(cache);
       if (Array.isArray(parsed) && parsed.length) {
         if (!parsed[0] || parsed[0].role !== "system") {
-          parsed.unshift({ role: "system", content: SYSTEM_PROMPT });
+          parsed.unshift({ role: "system", content: finalPrompt });
         }
         return parsed;
       }
@@ -372,7 +352,7 @@ function loadSession() {
       try { localStorage.removeItem(currentSessionKey()); } catch (e) {}
     }
   }
-  return [{ role: "system", content: SYSTEM_PROMPT }];
+  return [{ role: "system", content: finalPrompt }];
 }
 
 function saveSession(history) {
@@ -1109,8 +1089,18 @@ function demoReply(messages) {
 /* ==================== 十四. 提交 / 清空 / 历史 ==================== */
 
 function buildRequestMessages() {
+  /* [新增] 读取宣泄对象与背景信息 */
+  const ventTarget = document.getElementById("ventTarget")?.value.trim() || "";
+  const ventBio = document.getElementById("ventBio")?.value.trim() || "";
+
+  /* [新增] 在原 SYSTEM_PROMPT 基础上追加背景, 原文本不做任何改动 */
+  finalPrompt = SYSTEM_PROMPT;
+  if (ventTarget || ventBio) {
+    finalPrompt += `\n【宣泄对象：${ventTarget}】\n【对象背景描述：${ventBio}】`;
+  }
+
   const level = getStrengthLevel();
-  const strongPrompt = SYSTEM_PROMPT + "\n\n" + level.prompt;
+  const strongPrompt = finalPrompt + "\n\n" + level.prompt;
 
   return chatHistory.map(function (msg, index) {
     if (index === 0 && msg.role === "system") {
@@ -1233,7 +1223,7 @@ async function handleClear() {
   chatArea.innerHTML = "";
   messages.forEach(function (el) { el.style.animationDelay = ""; });
 
-  chatHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+  chatHistory = [{ role: "system", content: finalPrompt }];
   saveSession(chatHistory);
 
   userInput.value = "";
