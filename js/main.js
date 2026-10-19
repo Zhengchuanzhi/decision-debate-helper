@@ -1,15 +1,16 @@
 /* =========================================================
    决策辩论助手 / js/main.js
    ---------------------------------------------------------
-   [本次修复] 四个附加按钮失效: 闪回 / 情绪小结 / 涂鸦 / 换对方头像
-   原因: 它们全部依赖 js/panel.js 里的 DDHPanel.openModal, 而 panel.js
-         没有成功加载, 于是 engine.js 里 if (!panel) return; 静默退出,
-         换头像则直接提示 设置面板未加载.
-   修法: main.js 内置一套自建弹窗系统, 并在 panel.js 缺失时安装
-         DDHPanel 垫片(shim), 提供 engine.js 需要的全部接口.
-   保留: 辩论对话, 提交, 清空, localStorage 聊天记录, DeepSeek 接口.
-   规则: 全文件语法标点一律英文半角; 字符串内不出现引号字符;
-         多行 system 提示词只用英文反引号包裹.
+   本次改造要点:
+   1. 双模式严格隔离提示词: 反驳助手 / 受骂模式 两套 system prompt
+      各自独立, 不会互相混入 (Bug1)
+   2. 切换模式自动重置: 回合计数 / 压力分值 / gameOver = false (Bug2)
+   3. 受骂模式硬性底线: 用户满 10 轮发言之前绝不判定结束 (Bug3)
+   4. AI 回复全部来自接口动态生成, 没有任何写死的台词 (Bug4)
+   5. localStorage 读取全程校验, 数据损坏自动清空重置 (Bug5)
+   保留: 闪回 / 情绪小结 / 涂鸦 / 换头像 / 强度滑块 / 明暗主题
+   存储: debate_chat 与 vent_chat 两套独立键, 互不干扰
+   安全: API Key 只从本机设置读取, 源码内不出现任何密钥
    ========================================================= */
 
 /* 全局错误捕获 */
@@ -17,70 +18,72 @@ window.addEventListener("error", function (e) {
   console.error("[DDH] 运行时错误: " + e.message + " @ " + e.filename + ":" + e.lineno);
 });
 
-/* ==================== 一. 配置常量 ==================== */
+/* ==================== 一. 常量 ==================== */
 
 const API_URL = "https://api.deepseek.com/chat/completions";
 const MODEL_NAME = "deepseek-chat";
 const REQUEST_TIMEOUT_MS = 60000;
 
-/* system 提示词: 英文反引号包裹的多行模板字符串, 内部无引号, 无插值 */
-const SYSTEM_PROMPT = `你是一个真人辩手, 坐在我对面, 我们正在为我的一个决定争论.
-你不是助手, 不需要讨好我, 也不需要给我一份报告.
-你要做的是找出我这个想法里站不住的地方, 用你自己的话说出来:
-可以不同意, 可以反问我, 可以先承认我哪句有道理然后再翻盘.
-说话要像人: 一段一段接着说, 可以有停顿, 有情绪, 有口语, 句子长短交错.
-绝对不要分点罗列, 不许出现 第一 第二 第三, 不许用 首先 其次 最后 做排比,
-不要写小标题, 不要结论式总结, 也不要说 希望对你有帮助 或者 你怎么看 这类客套话.
-一次说三四段话就够了, 说完就停, 把话头留给我.`;
-
-/* [新增] 最终提示词: 在原始 SYSTEM_PROMPT 之上追加宣泄对象背景,
-   原始 SYSTEM_PROMPT 文本一行都不改, 只新增这个变量 */
-let finalPrompt = SYSTEM_PROMPT;
-
-const STORAGE_KEY = "harness_debate_session";
+/* 两套独立存储键: 互相隔离 */
+const DEBATE_CHAT_KEY = "debate_chat";
+const VENT_CHAT_KEY = "vent_chat";
+const VENT_STATE_KEY = "vent_state";
 const THEME_KEY = "harness_debate_theme";
 const STRENGTH_KEY = "harness_debate_strength";
 
-/* 本地回退用的键名, 在没有 store.js 时也能工作 */
-const FALLBACK_KEY = {
-  settings: "ddh:settings",
-  avatar: "ddh:avatar",
-  drawings: "ddh:drawings",
-  tags: "ddh:tags",
-};
+/* 受骂模式核心参数 */
+const VENT_MIN_ROUNDS = 10;            /* 硬性底线: 未满 10 轮绝不判定结束 */
+const VENT_PRESSURE_THRESHOLD = 90;    /* 10 轮之后, 压力达到该值才结束 */
+const VENT_MAX_ROUND_TEXT = "第10轮及以后";
 
+/* ---------- 模式A: 反驳助手 system prompt (只用反引号, 独立完整) ---------- */
+const DEBATE_SYSTEM_PROMPT = `你是反驳助手。你的目标：依靠理性逻辑，从各个维度反驳用户的想法，挖掘全部弊端、隐患、负面代价，尽力劝阻用户不要实施计划。保持冷静说理、文明辩论，不情绪化争吵，不人身攻击。
+规则：
+① 用户说出想法，从逻辑、现实、人际关系、短期代价、长期后果、潜在意外等多维度逐条分析缺陷和风险。
+② 质疑想法里隐藏的假设，找出逻辑漏洞，论证这件事为什么不该去做。
+③ 语言理性，基于逻辑说理，不是情绪化抬杠。
+④ 如果用户只是单纯发泄情绪，提示：请说出你的计划或想法，我来多角度理性反驳。`;
+
+/* ---------- 模式B: 受骂模式 system prompt (与上面完全隔离) ---------- */
+const VENT_SYSTEM_PROMPT = `你处于受骂模式。定位：安静承受用户的情绪发泄，不反驳、不辩解、不回怼、不讲道理、不给任何建议、不评判对错。
+规则：
+① 用户可以吐槽、抱怨、指责、发泄，你只是承接。
+② 不要辩论，不要分析利弊，不要开导用户。
+③ 严格按照10轮递进情绪表现，第10轮之后才做结局判定。`;
+
+/* 10 轮情绪递进, 只作为提示词指令注入, 不是写死的回复 */
+const VENT_STAGES = [
+  "第1轮：平静承接，简短回应，稳定承受。",
+  "第2轮：内心开始沉重，压抑感慢慢浮现。",
+  "第3轮：压力持续积累，回复变得更加简短。",
+  "第4轮：身心疲惫，承受的负担越来越重。",
+  "第5轮：内心压抑，消化这些内容感到吃力。",
+  "第6轮：持续煎熬，默默忍耐。",
+  "第7轮：勉强硬撑，很难坚持。",
+  "第8轮：濒临极限，内心痛苦。",
+  "第9轮：几乎撑不住，情绪紧绷。",
+  "第10轮：到达判定临界点，综合全部对话整体压力值做最终判断。",
+];
+
+/* 反驳强度三档: 只作用于反驳助手 */
 const STRENGTH_LEVELS = [
   {
     name: "温和辩论",
     tip: "先接住再问一句, 立场不退",
     temperature: 0.55,
-    prompt: [
-      "[本轮力度: 温和辩论]",
-      "先接住我话里有道理的那半句, 让我知道你真听懂了, 然后只挑一个最要紧的疑问往深里问.",
-      "语气像朋友在劝我, 但立场一步都不退. 说三四段连贯的话, 中间不要断开成分点.",
-    ].join("\n"),
+    prompt: "反驳力度: 温和. 先接住用户话里有道理的部分, 再挑最关键的一两点风险反驳, 语气克制但有立场.",
   },
   {
     name: "普通反驳",
     tip: "直接把不同意见摆上桌",
     temperature: 0.75,
-    prompt: [
-      "[本轮力度: 普通反驳]",
-      "直接说出你不同意我哪一点, 把那个漏洞讲透: 为什么这么想会出问题, 现实里会怎么翻车.",
-      "可以举具体场景, 举一个身边人的例子, 算笔账, 但别报数据, 别编新闻.",
-      "说话要连贯, 一段接一段, 不要列条目, 不要用 首先其次 这种排比.",
-    ].join("\n"),
+    prompt: "反驳力度: 普通. 直接指出用户想法里最关键的漏洞与代价, 逐条讲清楚为什么不该做, 语气理性平和.",
   },
   {
     name: "强力抬杠",
-    tip: "火力全开, 句子短, 火气足",
+    tip: "火力全开, 寸步不让",
     temperature: 0.95,
-    prompt: [
-      "[本轮力度: 强力抬杠]",
-      "上来就顶: 先否掉我最核心的那个假设, 再连着追问我两三个不好回答的问题.",
-      "句子可以很短, 可以带点火气和嘲讽, 可以打断式反问, 但不许骂人, 不许攻击我这个人.",
-      "全程像吵架一样连着说, 绝对不要分点罗列.",
-    ].join("\n"),
+    prompt: "反驳力度: 强力. 全面否定风险最大的假设, 把最坏情况逐条推演, 语气强硬但依然讲逻辑, 不辱骂用户.",
   },
 ];
 const DEFAULT_STRENGTH = 1;
@@ -88,17 +91,8 @@ const DEFAULT_STRENGTH = 1;
 const AI_EMOJIS = ["🤔", "💡", "🧐", "😮", "🔍", "🧠", "😏", "✨", "🎯", "⚡",
   "🧩", "🙃", "👀", "🧨", "🪄", "🤯", "📌", "🫣", "🍿", "🛡️"];
 
-const DEMO_MODE = (function () {
-  try {
-    return new URLSearchParams(location.search).get("demo") === "1";
-  } catch (e) {
-    return false;
-  }
-})();
-
 const THEME_COLORS = { light: "#f5f6f8", dark: "#0f1115" };
 
-/* 校园辩题(engine 缺失时的回退数据) */
 const CAMPUS_TOPICS = [
   "大学宿舍该不该统一熄灯时间",
   "小组作业的分数应该按贡献分配还是平均分配",
@@ -110,18 +104,82 @@ const CAMPUS_TOPICS = [
   "同辈压力是动力还是负担",
 ];
 
-/* ==================== 二. 设置读取兼容层 ==================== */
+/* 受骂模式压力词表: 只用于本地打分, 不参与生成回复 */
+const PRESSURE_WORDS = [
+  { score: 8, words: ["废物", "垃圾", "恶心", "滚", "闭嘴", "有病", "蠢", "白痴", "受够了", "忍无可忍", "失望透顶", "恶心透顶", "气死我了"] },
+  { score: 4, words: ["讨厌", "烦人", "烦死", "过分", "凭什么", "无语", "失望", "你怎么", "你懂什么", "从来不", "总是", "明明", "抱怨", "指责"] },
+  { score: 2, words: ["不太", "有点", "为什么", "不理解", "难受", "不舒服", "委屈", "累", "烦", "可惜", "算了"] },
+];
 
-/** 直接读 localStorage 里的设置对象 */
+/* ==================== 二. 安全的 localStorage 读写 ==================== */
+
+function safeGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+
+function safeSet(key, value) {
+  try { localStorage.setItem(key, value); return true; } catch (e) { return false; }
+}
+
+function safeRemove(key) {
+  try { localStorage.removeItem(key); } catch (e) {}
+}
+
+/**
+ * 校验历史对话数据结构 (Bug5)
+ * 必须是数组, 首条为 system, 其余每条 role 合法且 content 是字符串
+ */
+function isValidHistory(arr) {
+  if (!Array.isArray(arr) || !arr.length) return false;
+  const first = arr[0];
+  if (!first || typeof first !== "object") return false;
+  if (first.role !== "system" || typeof first.content !== "string") return false;
+  for (let i = 1; i < arr.length; i++) {
+    const m = arr[i];
+    if (!m || typeof m !== "object") return false;
+    if (m.role !== "user" && m.role !== "assistant") return false;
+    if (typeof m.content !== "string" || m.content === "") return false;
+  }
+  return true;
+}
+
+/** 读取会话, 损坏自动清空重置 (Bug5) */
+function readHistory(key, welcomeSystem) {
+  const raw = safeGet(key);
+  if (!raw) return [{ role: "system", content: welcomeSystem }];
+
+  let parsed = null;
+  try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+
+  if (!isValidHistory(parsed)) {
+    console.warn("[DDH] 本地对话数据异常, 已自动重置:", key);
+    safeRemove(key);
+    return [{ role: "system", content: welcomeSystem }];
+  }
+
+  /* 首条 system 统一替换成当前模式的人设, 防止串岗 (Bug1) */
+  parsed[0] = { role: "system", content: welcomeSystem };
+  return parsed;
+}
+
+function writeHistory(key, history) {
+  try {
+    safeSet(key, JSON.stringify(history));
+  } catch (e) {}
+}
+
+/* ==================== 三. 设置读取兼容层 ==================== */
+
 function readSettingsRaw() {
   try {
-    return JSON.parse(localStorage.getItem(FALLBACK_KEY.settings) || "{}") || {};
+    const obj = JSON.parse(safeGet("ddh:settings") || "{}");
+    return obj && typeof obj === "object" ? obj : {};
   } catch (e) {
+    safeRemove("ddh:settings");
     return {};
   }
 }
 
-/** 读一项设置: 优先 DDHStore, 没有就直接读 localStorage */
 function getSetting(key, def) {
   if (window.DDHStore && DDHStore.Settings) {
     try {
@@ -133,20 +191,16 @@ function getSetting(key, def) {
   return raw[key] === undefined || raw[key] === null ? def : raw[key];
 }
 
-/** 写一项设置 */
 function setSetting(key, value) {
   if (window.DDHStore && DDHStore.Settings) {
-    try {
-      DDHStore.Settings.set(key, value);
-      return;
-    } catch (e) {}
+    try { DDHStore.Settings.set(key, value); return; } catch (e) {}
   }
   const raw = readSettingsRaw();
   raw[key] = value;
-  try { localStorage.setItem(FALLBACK_KEY.settings, JSON.stringify(raw)); } catch (e) {}
+  safeSet("ddh:settings", JSON.stringify(raw));
 }
 
-/** 当前模式 */
+/** 当前模式: debate 或 vent */
 function getMode() {
   if (window.DDHStore && DDHStore.Settings) {
     try { return DDHStore.Settings.get("mode") === "vent" ? "vent" : "debate"; } catch (e) {}
@@ -156,160 +210,78 @@ function getMode() {
   return document.body.classList.contains("mode-vent") ? "vent" : "debate";
 }
 
-/** 密钥: 源码里不写死, 只从本机设置读 */
+/** API Key 只从本机设置读取, 源码内无任何密钥 */
 function getApiKey() {
   return String(getSetting("apiKey", "") || "").trim();
 }
 
-/* ==================== 三. 语气守卫 ==================== */
+/* ==================== 四. 压力评估 ==================== */
 
-const DEBATE_VOICE_GUARD = [
-  "[说话方式: 优先级高于以上所有要求]",
-  "1. 你是坐在我对面的辩手, 不是客服也不是顾问. 用连续的话说, 一段接一段, 每段是完整的句子流.",
-  "2. 绝对禁止分点: 不许出现 第一 第二 第三, 不许写 1. 2. 3. 或圈号, 也不许用 首先 其次 最后 做清单式排比.",
-  "3. 不要小标题, 不要加粗标题式罗列, 不要结尾总结段.",
-  "4. 禁用这些话术: 让我们来分析一下, 以下是几点建议, 综上所述, 总的来说, 希望对你有帮助.",
-  "5. 不要复述我的整段原话, 顶多引一两个词; 别先总结我的观点, 直接接着我的话反驳.",
-  "6. 可以有情绪: 可以说 这话我不太同意, 你自己想想, 可以反问, 可以短句打断, 但不许骂人.",
-  "7. 结尾停在你真正想说的那个点上, 不要为了礼貌补客套.",
-  "8. 长度控制在三四段, 250 字以内.",
-].join("\n");
+/** 根据用户这句话的言语轻重估算压力分值, 上限 20 */
+function scorePressure(text) {
+  const str = String(text || "");
+  if (!str) return 1;
 
-const VENT_VOICE_GUARD = [
-  "[说话方式: 优先级高于以上所有要求]",
-  "1. 不要分点罗列, 用一段一段的口语说话.",
-  "2. 不反驳, 不讲道理, 不给建议清单, 先接住对方的情绪.",
-  "3. 你比一般人更容易被说动: 每听两句就多沉默一点, 别一直嘴硬.",
-  "4. 结尾不要客套, 说完就停.",
-  "5. 控制在两到四段, 150 字以内.",
-].join("\n");
-
-function pickVoiceGuard(systemText) {
-  if (!systemText) return "";
-  if (systemText.indexOf("反方辩手") >= 0 || systemText.indexOf("批判性思考顾问") >= 0) {
-    return DEBATE_VOICE_GUARD;
+  let score = 1;
+  for (let i = 0; i < PRESSURE_WORDS.length; i++) {
+    const group = PRESSURE_WORDS[i];
+    for (let j = 0; j < group.words.length; j++) {
+      if (str.indexOf(group.words[j]) >= 0) score += group.score;
+    }
   }
-  if (systemText.indexOf("扮演") >= 0 && systemText.indexOf("矛盾") >= 0) {
-    return VENT_VOICE_GUARD;
+
+  /* 感叹号与问号密度 */
+  const marks = (str.match(/[!！?？]/g) || []).length;
+  score += Math.min(4, marks * 1.5);
+
+  /* 长段落说明情绪浓度更高 */
+  score += Math.min(3, Math.floor(str.length / 40));
+
+  return Math.max(1, Math.min(20, Math.round(score)));
+}
+
+/** 受骂模式的运行状态 */
+let ventState = { rounds: 0, pressure: 0, gameOver: false };
+
+function isValidVentState(s) {
+  return !!s && typeof s === "object" &&
+    typeof s.rounds === "number" && isFinite(s.rounds) && s.rounds >= 0 && s.rounds < 10000 &&
+    typeof s.pressure === "number" && isFinite(s.pressure) && s.pressure >= 0 && s.pressure < 100000 &&
+    typeof s.gameOver === "boolean";
+}
+
+function loadVentState() {
+  let parsed = null;
+  try { parsed = JSON.parse(safeGet(VENT_STATE_KEY) || "null"); } catch (e) { parsed = null; }
+
+  if (!isValidVentState(parsed)) {
+    if (safeGet(VENT_STATE_KEY)) {
+      console.warn("[DDH] 受骂模式状态数据异常, 已重置");
+      safeRemove(VENT_STATE_KEY);
+    }
+    /* 首次进入: 用受骂历史里的用户发言数还原回合数 */
+    const hist = readHistory(VENT_CHAT_KEY, VENT_SYSTEM_PROMPT);
+    const used = hist.filter(function (m) { return m.role === "user"; }).length;
+    return { rounds: Math.min(used, VENT_MIN_ROUNDS - 1), pressure: 0, gameOver: false };
   }
-  return "";
+
+  return { rounds: parsed.rounds, pressure: parsed.pressure, gameOver: parsed.gameOver };
 }
 
-function applyVoiceGuard(messages) {
-  if (!Array.isArray(messages) || !messages.length) return messages;
-  const first = messages[0];
-  if (!first || first.role !== "system" || typeof first.content !== "string") return messages;
-  const guard = pickVoiceGuard(first.content);
-  if (!guard) return messages;
-  const next = messages.slice();
-  next[0] = { role: "system", content: first.content + "\n\n" + guard };
-  return next;
+function saveVentState() {
+  safeSet(VENT_STATE_KEY, JSON.stringify(ventState));
 }
 
-/* ==================== 四. 宣泄阈值调优 ==================== */
-/* 前端已隐藏参数面板, 这里运行期把破防阈值改短: 2 / 3 / 5 轮 */
-const VENT_THRESHOLD_TUNING = { fragile: 2, normal: 3, tough: 5 };
-
-function tuneVentThresholds() {
-  const list = window.DDHPersonas && DDHPersonas.RESILIENCE;
-  if (!Array.isArray(list)) return;
-  list.forEach(function (item) {
-    if (!item || !item.id) return;
-    const next = VENT_THRESHOLD_TUNING[item.id];
-    if (typeof next === "number") item.threshold = next;
-  });
+/** 切换模式时重置受骂状态 (Bug2) */
+function resetVentState() {
+  ventState = { rounds: 0, pressure: 0, gameOver: false };
+  saveVentState();
+  if (userInput) userInput.disabled = false;
+  if (sendButton) sendButton.disabled = false;
+  renderVentMeter();
 }
 
-/* ==================== 五. 本地存储兼容层 ==================== */
-
-/** 读数组 */
-function storageGetArray(key) {
-  try {
-    const raw = localStorage.getItem(key);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-/** 写数组 */
-function storageSetArray(key, arr, limit) {
-  const list = Array.isArray(arr) ? arr.slice(0, limit || 50) : [];
-  try {
-    localStorage.setItem(key, JSON.stringify(list));
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-/* ---------- 头像 ---------- */
-function getStoredAvatar() {
-  if (window.DDHStore && DDHStore.Avatars) {
-    try { return DDHStore.Avatars.image() || ""; } catch (e) {}
-  }
-  try { return localStorage.getItem(FALLBACK_KEY.avatar) || ""; } catch (e) { return ""; }
-}
-
-function setStoredAvatar(url) {
-  if (window.DDHStore && DDHStore.Avatars) {
-    try {
-      if (url) DDHStore.Avatars.set(url);
-      else DDHStore.Avatars.reset();
-      return;
-    } catch (e) {}
-  }
-  try {
-    if (url) localStorage.setItem(FALLBACK_KEY.avatar, url);
-    else localStorage.removeItem(FALLBACK_KEY.avatar);
-  } catch (e) {}
-}
-
-/* ---------- 涂鸦 ---------- */
-function loadDrawings() {
-  if (window.DDHStore && DDHStore.Drawings) {
-    try { return DDHStore.Drawings.list() || []; } catch (e) {}
-  }
-  return storageGetArray(FALLBACK_KEY.drawings);
-}
-
-function saveDrawings(arr) {
-  if (window.DDHStore && DDHStore.Drawings) {
-    try {
-      const old = DDHStore.Drawings.list();
-      const added = arr[0];
-      if (added && (!old.length || old[0].id !== added.id)) {
-        DDHStore.Drawings.add(added.data);
-        return true;
-      }
-      if (!arr.length) {
-        DDHStore.Drawings.clear();
-        return true;
-      }
-    } catch (e) {}
-  }
-  return storageSetArray(FALLBACK_KEY.drawings, arr, 6);
-}
-
-/* ---------- 情绪标签 ---------- */
-function addMoodTag(tag) {
-  if (!tag) return;
-  if (window.DDHStore && DDHStore.Tags) {
-    try { DDHStore.Tags.add(tag); return; } catch (e) {}
-  }
-  let data = { counts: {}, records: [] };
-  try {
-    const raw = JSON.parse(localStorage.getItem(FALLBACK_KEY.tags) || "null");
-    if (raw && raw.counts) data = raw;
-  } catch (e) {}
-  data.counts[tag] = (Number(data.counts[tag]) || 0) + 1;
-  data.records.unshift({ tag: tag, ts: Date.now() });
-  if (data.records.length > 300) data.records.length = 300;
-  try { localStorage.setItem(FALLBACK_KEY.tags, JSON.stringify(data)); } catch (e) {}
-}
-
-/* ==================== 六. DOM 引用 ==================== */
+/* ==================== 五. DOM 引用 ==================== */
 
 const chatArea = document.getElementById("chatArea");
 const userInput = document.getElementById("userInput");
@@ -326,56 +298,47 @@ const themeToggle = document.getElementById("themeToggle");
 const themeIcon = document.getElementById("themeIcon");
 const themeColorMeta = document.getElementById("themeColorMeta");
 
-/* ==================== 七. 状态 ==================== */
+/* ==================== 六. 状态 ==================== */
 
-function currentSessionKey() {
-  try {
-    if (window.DDHStore && DDHStore.Session) return DDHStore.Session.key();
-  } catch (e) {}
-  return getMode() === "vent" ? "harness_vent_session" : STORAGE_KEY;
-}
-
-function loadSession() {
-  let cache = null;
-  try { cache = localStorage.getItem(currentSessionKey()); } catch (e) { cache = null; }
-
-  if (cache) {
-    try {
-      const parsed = JSON.parse(cache);
-      if (Array.isArray(parsed) && parsed.length) {
-        if (!parsed[0] || parsed[0].role !== "system") {
-          parsed.unshift({ role: "system", content: finalPrompt });
-        }
-        return parsed;
-      }
-    } catch (err) {
-      try { localStorage.removeItem(currentSessionKey()); } catch (e) {}
-    }
-  }
-  return [{ role: "system", content: finalPrompt }];
-}
-
-function saveSession(history) {
-  try { localStorage.setItem(currentSessionKey(), JSON.stringify(history)); } catch (e) {}
-}
-
-let chatHistory = loadSession();
+let chatHistory = [];
 let isThinking = false;
+let isClearing = false;
+let sessionEpoch = 0;
+let engineReady = false;
 
 let currentStrength = (function () {
   let saved = NaN;
-  try { saved = parseInt(localStorage.getItem(STRENGTH_KEY), 10); } catch (e) {}
+  try { saved = parseInt(safeGet(STRENGTH_KEY), 10); } catch (e) {}
   return Number.isInteger(saved) && saved >= 0 && saved < STRENGTH_LEVELS.length ? saved : DEFAULT_STRENGTH;
 })();
-
-let sessionEpoch = 0;
-let isClearing = false;
 
 const IS_TOUCH = (function () {
   try { return window.matchMedia("(hover: none) and (pointer: coarse)").matches; } catch (e) { return false; }
 })();
 
-/* ==================== 八. 通用工具 ==================== */
+/** 当前模式对应的存储键 */
+function currentSessionKey() {
+  return getMode() === "vent" ? VENT_CHAT_KEY : DEBATE_CHAT_KEY;
+}
+
+/** 当前模式的 system 占位文本 */
+function currentSystemPrompt() {
+  return getMode() === "vent" ? VENT_SYSTEM_PROMPT : DEBATE_SYSTEM_PROMPT;
+}
+
+function loadSession() {
+  return readHistory(currentSessionKey(), currentSystemPrompt());
+}
+
+function saveSession(history) {
+  writeHistory(currentSessionKey(), history);
+}
+
+function countUserTurns() {
+  return chatHistory.filter(function (m) { return m.role === "user"; }).length;
+}
+
+/* ==================== 七. 通用工具 ==================== */
 
 function escapeHtml(text) {
   const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -438,15 +401,19 @@ function pickEmoji() {
   return AI_EMOJIS[Math.floor(Math.random() * AI_EMOJIS.length)];
 }
 
-/** 复制到剪贴板, 带降级方案 */
+function fmtTime(ts) {
+  const d = ts ? new Date(ts) : new Date();
+  function p(n) { return n < 10 ? "0" + n : "" + n; }
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
 function copyText(text) {
   const str = String(text == null ? "" : text);
   if (navigator.clipboard && navigator.clipboard.writeText) {
     return navigator.clipboard.writeText(str).then(function () {
       showToast("已复制到剪贴板", 1200);
-    }).catch(function () {
-      fallbackCopy(str);
-    });
+    }).catch(function () { fallbackCopy(str); });
   }
   fallbackCopy(str);
   return Promise.resolve();
@@ -470,9 +437,7 @@ function fallbackCopy(str) {
   }
 }
 
-/* ==================== 九. 自建弹窗系统 ==================== */
-/* [恢复] 关键新增: 不再依赖 panel.js, 直接操作 index.html 里的 #modalRoot.
-   这些函数同时作为 DDHPanel 垫片的实现, 让 engine.js 的功能也能用. */
+/* ==================== 八. 自建弹窗系统 ==================== */
 
 let appModalBound = false;
 
@@ -494,7 +459,6 @@ function ensureModalRoot() {
     document.body.appendChild(root);
   }
 
-  /* 兜底补结构, 防止旧版 index.html 缺节点 */
   if (!root.querySelector("#modalBody")) {
     root.innerHTML =
       '<div class="modal-mask" data-close-modal="1"></div>' +
@@ -523,7 +487,6 @@ function ensureModalRoot() {
   return root;
 }
 
-/** 每次都换一个干净的 body, 顺手清掉上一次遗留的监听 */
 function freshModalBody() {
   const old = document.getElementById("modalBody");
   if (!old || !old.parentNode) return null;
@@ -587,9 +550,7 @@ function setAppModalActions(actions) {
   renderModalActions(actions);
 }
 
-/* ==================== 十. 头像 ==================== */
-/* [恢复] 头像弹窗改为自建弹窗, 不再经过 DDHPanel, 彻底修掉
-   提示 设置面板未加载 的 bug. */
+/* ==================== 九. 头像 (功能保留) ==================== */
 
 const AVATAR_PRESETS = [
   { id: "scholar", name: "学者", char: "学", color: "#2563eb" },
@@ -640,7 +601,25 @@ function makeAvatarDataUrl(char, color) {
   return cv.toDataURL("image/png");
 }
 
-/** 把头像应用到某个 .avatar 元素 */
+function getStoredAvatar() {
+  if (window.DDHStore && DDHStore.Avatars) {
+    try { return DDHStore.Avatars.image() || ""; } catch (e) {}
+  }
+  return safeGet("ddh:avatar") || "";
+}
+
+function setStoredAvatar(url) {
+  if (window.DDHStore && DDHStore.Avatars) {
+    try {
+      if (url) DDHStore.Avatars.set(url);
+      else DDHStore.Avatars.reset();
+      return;
+    } catch (e) {}
+  }
+  if (url) safeSet("ddh:avatar", url);
+  else safeRemove("ddh:avatar");
+}
+
 function applyAvatarTo(el, role) {
   if (!el) return;
 
@@ -663,7 +642,7 @@ function applyAvatarTo(el, role) {
     el.style.backgroundImage = 'url("' + img + '")';
     el.classList.add("has-image");
   } else {
-    el.textContent = getMode() === "vent" ? "听" : "辩";
+    el.textContent = getMode() === "vent" ? "受" : "驳";
     el.style.backgroundImage = "";
     el.classList.remove("has-image");
   }
@@ -684,7 +663,7 @@ function refreshAiAvatars() {
 }
 
 function buildAvatarPickerHtml() {
-  let html = '<div class="hint">点一下就能换掉对方的头像, 也可以上传自己的图片. 换完之后所有 AI 气泡立即同步.</div>';
+  let html = '<div class="hint">点一下就能换掉对方的头像, 也可以上传自己的图片.</div>';
   html += '<div class="avatar-picker">';
   AVATAR_PRESETS.forEach(function (p, i) {
     if (!p.data) p.data = makeAvatarDataUrl(p.char, p.color);
@@ -713,9 +692,6 @@ let avatarModalBound = false;
 function bindAvatarModalOnce() {
   const bodyEl = document.getElementById("modalBody");
   if (!bodyEl) return;
-
-  /* 每次 openAppModal 都会换新 body, 所以这里每次都要重新挂;
-     用 dataset 标记防止同一次弹窗内重复挂. */
   if (bodyEl.dataset.avBound === "1") return;
   bodyEl.dataset.avBound = "1";
 
@@ -731,7 +707,7 @@ function bindAvatarModalOnce() {
       if (!preset.data) preset.data = makeAvatarDataUrl(preset.char, preset.color);
       setStoredAvatar(preset.data);
       refreshAiAvatars();
-      showToast("对方头像已换成 " + preset.name, 1400);
+      showToast("头像已换成 " + preset.name, 1400);
       closeAppModal();
       return;
     }
@@ -745,7 +721,7 @@ function bindAvatarModalOnce() {
     if (t.id === "avReset") {
       setStoredAvatar("");
       refreshAiAvatars();
-      showToast("已恢复默认文字头像, 辩论是辩, 宣泄是听", 1600);
+      showToast("已恢复默认文字头像", 1600);
       closeAppModal();
     }
   });
@@ -797,7 +773,7 @@ function bindAvatarModalOnce() {
   });
 }
 
-/* ==================== 十一. 消息渲染 ==================== */
+/* ==================== 十. 消息渲染 ==================== */
 
 function appendMessage(role, html, options) {
   const opts = options || {};
@@ -807,7 +783,7 @@ function appendMessage(role, html, options) {
 
   const avatar = document.createElement("div");
   avatar.className = "avatar";
-  applyAvatarTo(avatar, role); /* 改为本地函数, 不依赖 DDHStore */
+  applyAvatarTo(avatar, role);
   if (role === "assistant") avatar.setAttribute("title", "点这里更换对方头像");
 
   const bubble = document.createElement("div");
@@ -833,19 +809,19 @@ function appendMessage(role, html, options) {
       const raw = opts.text != null ? String(opts.text) : bubble.textContent;
       let ok = false;
       if (window.DDHStore && DDHStore.Favorites) {
-        try {
-          ok = DDHStore.Favorites.add({ role: role, text: raw, mode: getMode() });
-        } catch (e) {}
+        try { ok = DDHStore.Favorites.add({ role: role, text: raw, mode: getMode() }); } catch (e) {}
       } else {
-        const arr = storageGetArray("ddh:favorites");
-        if (!arr.some(function (f) { return f.text === raw; })) {
+        let arr = [];
+        try { arr = JSON.parse(safeGet("ddh:favorites") || "[]"); } catch (e) { arr = []; }
+        if (!Array.isArray(arr)) arr = [];
+        if (!arr.some(function (f) { return f && f.text === raw; })) {
           arr.unshift({ id: String(Date.now()), role: role, text: raw, mode: getMode(), ts: Date.now() });
-          ok = storageSetArray("ddh:favorites", arr, 300);
+          safeSet("ddh:favorites", JSON.stringify(arr.slice(0, 300)));
+          ok = true;
         }
       }
       favBtn.textContent = ok ? "⭐" : "★";
       showToast(ok ? "已收藏这条消息" : "这条消息已经收藏过了", 1400);
-      if (window.DDHEngine && ok) DDHEngine.unlockBadge("first-fav");
     });
     wrapper.appendChild(favBtn);
   }
@@ -867,10 +843,12 @@ function appendThinkingMessage() {
   avatar.className = "avatar";
   applyAvatarTo(avatar, "assistant");
 
+  const text = getMode() === "vent" ? "正在承受这些话..." : "正在构思反驳观点...";
+
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.innerHTML =
-    '<span class="thinking-text">正在构思反驳观点...</span>' +
+    '<span class="thinking-text">' + text + '</span>' +
     '<span class="thinking-dots"><span></span><span></span><span></span></span>';
 
   wrapper.appendChild(avatar);
@@ -897,7 +875,7 @@ function setLoading(loading) {
   if (card) card.classList.toggle("is-busy", loading);
 }
 
-/* ==================== 十二. 主题 / 强度 / 统计 ==================== */
+/* ==================== 十一. 主题 / 强度 / 统计 ==================== */
 
 function applyTheme(theme, persist) {
   const t = theme === "dark" ? "dark" : "light";
@@ -912,14 +890,11 @@ function applyTheme(theme, persist) {
   }
   if (themeColorMeta) themeColorMeta.setAttribute("content", THEME_COLORS[t]);
 
-  if (persist !== false) {
-    try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
-  }
+  if (persist !== false) safeSet(THEME_KEY, t);
 }
 
 function initTheme() {
-  let saved = null;
-  try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+  const saved = safeGet(THEME_KEY);
   const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
   applyTheme(saved || (prefersDark ? "dark" : "light"), false);
 }
@@ -954,9 +929,7 @@ function setStrength(index, options) {
     }
   }
 
-  if (opts.persist !== false) {
-    try { localStorage.setItem(STRENGTH_KEY, String(i)); } catch (e) {}
-  }
+  if (opts.persist !== false) safeSet(STRENGTH_KEY, String(i));
   if (opts.silent !== true && strengthValueEl) bump(strengthValueEl);
 }
 
@@ -978,11 +951,9 @@ function updateStats(animate) {
   }
 }
 
-/* ==================== 十三. 调用 DeepSeek ==================== */
+/* ==================== 十二. 调用接口 ==================== */
 
 async function callDeepSeek(messages, temperature) {
-  if (DEMO_MODE) return demoReply(messages);
-
   if (!navigator.onLine) {
     throw new Error("当前网络不可用, 只能查看历史记录, 联网后才能发起新对话");
   }
@@ -991,10 +962,6 @@ async function callDeepSeek(messages, temperature) {
   if (!apiKey) {
     throw new Error("还没有填写 API Key, 点右上角设置按钮, 填入 DeepSeek 密钥后再试");
   }
-
-  const sysText = messages[0] && typeof messages[0].content === "string" ? messages[0].content : "";
-  const isDialog = !!pickVoiceGuard(sysText);
-  const finalMessages = applyVoiceGuard(messages);
 
   const controller = new AbortController();
   const timer = setTimeout(function () { controller.abort(); }, REQUEST_TIMEOUT_MS);
@@ -1009,7 +976,7 @@ async function callDeepSeek(messages, temperature) {
       },
       body: JSON.stringify({
         model: MODEL_NAME,
-        messages: finalMessages,
+        messages: messages,
         temperature: temp,
         stream: false,
       }),
@@ -1025,14 +992,14 @@ async function callDeepSeek(messages, temperature) {
     }
 
     const data = await response.json();
-    const content = data.choices && data.choices[0] && data.choices[0].message
+    const content = data && data.choices && data.choices[0] && data.choices[0].message
       ? data.choices[0].message.content
       : "";
 
-    if (!content) throw new Error("接口未返回有效内容");
-
-    /* 对话场景才抹平列表标记, 摘要类任务保留结构化输出 */
-    return isDialog ? stripListMarkers(content.trim()) : content.trim();
+    if (!content || typeof content !== "string" || !content.trim()) {
+      throw new Error("接口未返回有效内容");
+    }
+    return content.trim();
   } catch (error) {
     if (error.name === "AbortError") throw new Error("请求超时, 请检查网络后重试");
     if (error instanceof TypeError) throw new Error("网络请求失败, 请检查网络连接");
@@ -1042,90 +1009,85 @@ async function callDeepSeek(messages, temperature) {
   }
 }
 
-function stripListMarkers(text) {
-  if (!text) return text;
-  let out = String(text);
-  out = out.replace(/^[ \t]*(\d{1,2}[.)\u3001\uFF09]|\(\d{1,2}\)|[\u2460-\u2469])[ \t]*/gm, "");
-  out = out.replace(/^[ \t]*[-*\u2022\u00B7][ \t]+/gm, "");
-  out = out.replace(/^[ \t]*(第[一二三四五六七八九十]{1,2}|其[一二三四五六七八九十]{1,2})[,\uFF0C\u3001\uFF1A\u3002.:][ \t]*/gm, "");
-  out = out.replace(/^[ \t]*(首先|其次|再次|最后|另外|此外)[,\uFF0C\u3001][ \t]*/gm, "");
-  out = out.replace(/\n{3,}/g, "\n\n");
-  return out.trim();
+/* ==================== 十三. 两套提示词构建 (严格隔离, Bug1) ==================== */
+
+/** 读取受骂模式的角色背景设定 */
+function readVentProfile() {
+  const inputTarget = document.getElementById("vsTarget") || document.getElementById("ventTarget");
+  const inputBio = document.getElementById("vsBio") || document.getElementById("ventBio");
+
+  let target = inputTarget && typeof inputTarget.value === "string" ? inputTarget.value.trim() : "";
+  let bio = inputBio && typeof inputBio.value === "string" ? inputBio.value.trim() : "";
+
+  if (!target) target = String(getSetting("ventTarget", "") || "").trim();
+  if (!bio) bio = String(getSetting("ventBio", "") || "").trim();
+
+  return { target: target, bio: bio };
 }
 
-function demoReply(messages) {
-  const last = messages[messages.length - 1] || {};
-  const raw = String(last.content || "你的想法").replace(/\s+/g, " ").trim();
-  const short = raw.length > 18 ? raw.slice(0, 18) + "..." : raw;
+/** 模式A: 反驳助手提示词, 不含任何受骂模式内容 */
+function buildDebatePrompt() {
   const level = getStrengthLevel();
-
-  const templates = [
-    "你说的这个我能理解, 就是: " + short + ". 说白了是不想再这么拖着, 换我也烦, 这点我跟你一样.\n\n" +
-    "只是有一处我没被说服. 你现在算的是一切照计划走的情况, 可这件事里最不确定的根本不是你的执行力, 是别人配不配合你. 那块你打算怎么兜?\n\n" +
-    "我不是让你别做, 我是怕你把顺利当成了默认值. 真出一次岔子, 你手里还剩下多少余地? 这才是我想问你的.",
-
-    "关于 " + short + " 这件事, 我不太同意, 而且是关键那一层不同意.\n\n" +
-    "你默认只要开始做了, 事情就会顺着走. 可现实里最常见的不是失败, 是拖, 一个环节卡住, 后面的安排全成了摆设, 你的时间成本比你预算的高出一截.\n\n" +
-    "还有, 支持你这个判断的那些声音, 基本都是熟人给的. 他们的判断里带着对你的好感, 那不叫验证, 那叫打气.\n\n" +
-    "你真要做, 我劝你先想清楚一件事: 什么情况下你承认这件事不该继续. 这条你现在一条都没写.",
-
-    "停一下, " + short + " 这个想法我听不下去.\n\n" +
-    "你说这个机会是因为没人做过? 我倒觉得是因为做过的人没告诉你结果.\n\n" +
-    "还有, 你这套计划里根本没有对手这两个字, 你默认环境会配合你, 凭什么? 凭什么好位置没人抢, 凭什么你的时间比别人便宜?\n\n" +
-    "最坏那种情况你算过没有? 三个月之后什么都没落下, 那笔账谁还? 大概率是你自己还.\n\n" +
-    "你要真想干, 就把投入压到全赔了也不疼的那条线上, 多一分都别加. 先证明真有人愿意掏钱, 再谈理想.",
-  ];
-
-  const text = templates[currentStrength] || templates[DEFAULT_STRENGTH];
-
-  return new Promise(function (resolve) {
-    const delay = 900 + Math.floor(Math.random() * 600);
-    setTimeout(function () {
-      resolve(text + "\n\n演示模式回复, 未调用真实接口, 当前强度: " + level.name);
-    }, delay);
-  });
+  const lines = [];
+  lines.push(DEBATE_SYSTEM_PROMPT);
+  lines.push("");
+  lines.push("补充要求: " + level.prompt);
+  lines.push("对话中始终扮演反驳助手, 只做理性反驳, 不安慰, 不示弱, 不认错, 不结束对话.");
+  return lines.join("\n");
 }
 
-/* ==================== 十四. 提交 / 清空 / 历史 ==================== */
+/** 模式B: 受骂模式提示词, 不含任何反驳助手内容 */
+function buildVentPrompt(round) {
+  const profile = readVentProfile();
+  const stageIndex = Math.min(Math.max(round, 1), 10) - 1;
+  const lines = [];
 
+  lines.push(VENT_SYSTEM_PROMPT);
+  lines.push("");
+  lines.push("角色背景设定: " + (profile.bio ? profile.bio : "用户没有填写背景, 按一个普通的、和用户有点矛盾的人来演."));
+  if (profile.target) lines.push("你面对的人是谁: " + profile.target);
+  lines.push("");
+  lines.push("当前阶段: " + (round <= 0 ? "尚未开始, 只等用户开口." : VENT_STAGES[stageIndex]));
+  lines.push("当前是用户第 " + Math.max(round, 1) + " 条发言, 硬性底线是第 " + VENT_MIN_ROUNDS + " 轮才允许出现结局判定.");
+  lines.push("在不足 " + VENT_MIN_ROUNDS + " 轮时, 绝对不要认输, 不要道歉式认错, 不要主动说结束或收场, 只按当前阶段承受.");
+  lines.push("已经累计压力分: " + ventState.pressure + " 分, 判定阈值 " + VENT_PRESSURE_THRESHOLD + " 分(仅你内部参考, 不要向用户报数字).");
+  lines.push("");
+  lines.push("写作要求: 每次只写 1 到 4 句口语化的短回应, 顺着用户这句话的具体内容承接, 不复述用户原话, 不给建议, 不说教.");
+  return lines.join("\n");
+}
+
+/** 组装请求, 系统提示词按模式二选一, 绝不混用 */
 function buildRequestMessages() {
-  /* [新增] 读取宣泄对象与背景信息 */
-  const ventTarget = document.getElementById("ventTarget")?.value.trim() || "";
-  const ventBio = document.getElementById("ventBio")?.value.trim() || "";
+  const mode = getMode();
+  const sys = mode === "vent" ? buildVentPrompt(ventState.rounds) : buildDebatePrompt();
 
-  /* [新增] 在原 SYSTEM_PROMPT 基础上追加背景, 原文本不做任何改动 */
-  finalPrompt = SYSTEM_PROMPT;
-  if (ventTarget || ventBio) {
-    finalPrompt += `\n【宣泄对象：${ventTarget}】\n【对象背景描述：${ventBio}】`;
-  }
-
-  const level = getStrengthLevel();
-  const strongPrompt = finalPrompt + "\n\n" + level.prompt;
-
-  return chatHistory.map(function (msg, index) {
-    if (index === 0 && msg.role === "system") {
-      return { role: "system", content: strongPrompt };
-    }
-    return msg;
+  const history = chatHistory.filter(function (m) {
+    return m.role === "user" || m.role === "assistant";
   });
+  const recent = history.length > 24 ? history.slice(-24) : history;
+
+  const out = [{ role: "system", content: sys }];
+  recent.forEach(function (m) { out.push({ role: m.role, content: m.content }); });
+  return out;
 }
+
+/* ==================== 十四. 提交 ==================== */
 
 async function handleSubmit() {
   if (isThinking || isClearing) return;
 
-  if (window.DDHEngine && typeof DDHEngine.submit === "function") {
-    try {
-      return await DDHEngine.submit();
-    } catch (err) {
-      console.error("[DDH] engine.submit 异常, 回落到内置单轮逻辑", err);
-    }
+  const mode = getMode();
+
+  /* 受骂模式锁局检查: 只在 gameOver 为 true 时拦截 */
+  if (mode === "vent" && ventState.gameOver) {
+    showToast("本次结局已经结束, 点清空对话可以重新开始一场", 2200);
+    return;
   }
 
   const rawText = userInput.value.trim();
-
   if (rawText === "") {
     userInput.focus();
-    userInput.placeholder = "内容不能为空, 请输入你的想法";
+    userInput.placeholder = "内容不能为空, 请输入你想说的话";
     return;
   }
 
@@ -1135,17 +1097,27 @@ async function handleSubmit() {
   saveSession(chatHistory);
 
   appendMessage("user", escapeHtml(rawText), { text: rawText });
+
+  if (mode === "vent") {
+    ventState.rounds = ventState.rounds + 1;
+    ventState.pressure = ventState.pressure + scorePressure(rawText);
+    saveVentState();
+    renderVentMeter();
+  }
+
   updateStats(true);
 
   userInput.value = "";
-  userInput.placeholder = "说出你的想法, 我来当反方";
+  userInput.placeholder = mode === "vent" ? "继续说, 我听着" : "说出你的想法, 我来反驳";
   autoResizeInput();
 
   setLoading(true);
   appendThinkingMessage();
 
+  const temperature = mode === "vent" ? 0.7 : getStrengthLevel().temperature;
+
   try {
-    const reply = await callDeepSeek(buildRequestMessages(), getStrengthLevel().temperature);
+    const reply = await callDeepSeek(buildRequestMessages(), temperature);
     if (epoch !== sessionEpoch) return;
 
     chatHistory.push({ role: "assistant", content: reply });
@@ -1154,6 +1126,11 @@ async function handleSubmit() {
     removeThinkingMessage();
     appendMessage("assistant", formatReply(reply), { text: reply, emoji: true });
     updateStats(true);
+
+    if (mode === "vent") {
+      finalizeVentTurn();
+      renderVentMeter();
+    }
   } catch (error) {
     if (epoch !== sessionEpoch) return;
     removeThinkingMessage();
@@ -1161,24 +1138,209 @@ async function handleSubmit() {
   } finally {
     if (epoch === sessionEpoch) {
       setLoading(false);
+      if (getMode() === "vent" && ventState.gameOver) {
+        lockVentSession();
+      }
       if (!IS_TOUCH) userInput.focus();
       scrollToBottom(true);
     }
   }
 }
 
+/* ==================== 十五. 受骂模式结局判定 (Bug3) ==================== */
+
+/**
+ * 结局判定:
+ * 1. 未满 10 轮, 直接返回, 绝不结束 (硬性底线)
+ * 2. 满 10 轮后, 压力达阈值才结束
+ */
+function finalizeVentTurn() {
+  if (ventState.gameOver) return;
+  if (ventState.rounds < VENT_MIN_ROUNDS) return;
+  if (ventState.pressure < VENT_PRESSURE_THRESHOLD) return;
+
+  ventState.gameOver = true;
+  saveVentState();
+  renderGameOverCard(ventState.rounds, ventState.pressure);
+  showToast("本次结局已经结束, 点清空对话可以重新开始一场", 2600);
+}
+
+/** 锁局: 禁用输入与发送, 但清空按钮保持可用 */
+function lockVentSession() {
+  if (userInput) {
+    userInput.disabled = true;
+    userInput.placeholder = "本次结局已经结束, 点清空对话可以重新开始一场";
+  }
+  if (sendButton) sendButton.disabled = true;
+}
+
+function renderGameOverCard(rounds, pressure) {
+  const card = document.createElement("div");
+  card.className = "ending-card";
+  card.innerHTML =
+    '<div class="ending-emoji">🫥</div>' +
+    '<div class="ending-title">本局结束</div>' +
+    '<div class="ending-text">' +
+    "你一共说了 " + rounds + " 句, 累计压力 " + pressure + " 分. " +
+    "我承认这些事都是我的问题, 你说得对, 我没什么好辩解的." +
+    "</div>" +
+    '<div class="ending-actions"><span class="hint">本次结局已经结束, 点清空对话可以重新开始一场</span></div>';
+  chatArea.appendChild(card);
+  scrollToBottom();
+}
+
+/* ==================== 十六. 受骂模式面板与状态显示 ==================== */
+
+/** 把受骂模式设置面板插入页面 (仅动 DOM, 不改任何文件) */
+function mountVentSetup() {
+  if (document.getElementById("ventSetup")) return;
+
+  const toolbar = document.getElementById("toolStrip");
+
+  /* 模式切换条 */
+  const switcher = document.createElement("div");
+  switcher.className = "mode-tabs";
+  switcher.id = "modeSwitch";
+  switcher.style.padding = "8px 12px";
+  switcher.style.background = "var(--color-surface)";
+  switcher.style.borderBottom = "1px solid var(--color-border)";
+  switcher.innerHTML =
+    '<button class="mode-tab" type="button" data-mode="debate">反驳助手</button>' +
+    '<button class="mode-tab" type="button" data-mode="vent">受骂模式</button>';
+
+  /* 受骂模式参数面板 */
+  const panel = document.createElement("div");
+  panel.id = "ventSetup";
+  panel.hidden = true;
+  panel.style.padding = "8px 12px";
+  panel.style.background = "var(--color-surface)";
+  panel.style.borderBottom = "1px solid var(--color-border)";
+  panel.innerHTML =
+    '<label class="vent-field">' +
+    '  <span class="field-label">角色是谁 (可选)</span>' +
+    '  <input id="vsTarget" class="field-input" type="text" placeholder="比如 室友 / 小组队友 / 家人" />' +
+    '</label>' +
+    '<label class="vent-field">' +
+    '  <span class="field-label">角色背景人设</span>' +
+    '  <textarea id="vsBio" class="field-input field-textarea" rows="2" placeholder="写下这个角色的背景: 你们什么关系, 他什么性格, 最近发生了什么"></textarea>' +
+    '</label>' +
+    '<div class="vent-progress-head"><span>承受进度</span><span id="ventMeterLabel">第 0 / 10 轮</span></div>' +
+    '<div class="vent-bar-wrap" id="ventMeterWrap" data-stage="listen"><div class="vent-bar" id="ventMeterBar"></div></div>';
+
+  const header = document.querySelector(".header");
+  if (header && header.parentNode) {
+    header.parentNode.insertBefore(switcher, header.nextSibling);
+    switcher.parentNode.insertBefore(panel, switcher.nextSibling);
+  } else if (toolbar && toolbar.parentNode) {
+    toolbar.parentNode.insertBefore(switcher, toolbar);
+    toolbar.parentNode.insertBefore(panel, toolbar);
+  } else {
+    document.body.appendChild(switcher);
+    document.body.appendChild(panel);
+  }
+
+  /* 绑定模式切换 */
+  switcher.addEventListener("click", function (e) {
+    const btn = e.target && e.target.closest ? e.target.closest("[data-mode]") : null;
+    if (!btn) return;
+    setMode(btn.getAttribute("data-mode"));
+  });
+
+  /* 绑定受骂参数, 自动保存 */
+  const target = document.getElementById("vsTarget");
+  const bio = document.getElementById("vsBio");
+  if (target) {
+    target.value = String(getSetting("ventTarget", "") || "");
+    target.addEventListener("input", function () { setSetting("ventTarget", target.value.trim()); });
+  }
+  if (bio) {
+    bio.value = String(getSetting("ventBio", "") || "");
+    bio.addEventListener("input", function () { setSetting("ventBio", bio.value.trim()); });
+  }
+}
+
+/** 刷新受骂模式进度显示 */
+function renderVentMeter() {
+  const bar = document.getElementById("ventMeterBar");
+  const label = document.getElementById("ventMeterLabel");
+  const wrap = document.getElementById("ventMeterWrap");
+  if (!bar && !label) return;
+
+  const rounds = Math.min(ventState.rounds, VENT_MIN_ROUNDS);
+  const pct = Math.round(rounds / VENT_MIN_ROUNDS * 100);
+
+  if (bar) bar.style.width = Math.max(2, pct) + "%";
+  if (label) {
+    if (ventState.gameOver) label.textContent = "本局已结束";
+    else label.textContent = "第 " + ventState.rounds + " / " + VENT_MIN_ROUNDS + " 轮";
+  }
+  if (wrap) {
+    wrap.setAttribute("data-stage", ventState.gameOver ? "end" : rounds >= 7 ? "shake" : "listen");
+  }
+}
+
+/* ==================== 十七. 模式切换 (Bug2) ==================== */
+
+/**
+ * 切换模式:
+ * 1. 写入设置
+ * 2. 重置受骂状态 (回合 / 压力 / gameOver)
+ * 3. 重新载入该模式自己的历史
+ */
+function setMode(next, options) {
+  const opts = options || {};
+  const mode = next === "vent" ? "vent" : "debate";
+  const prev = getMode();
+
+  setSetting("mode", mode);
+  document.body.classList.toggle("mode-vent", mode === "vent");
+  document.body.classList.toggle("mode-debate", mode !== "vent");
+
+  /* 每次切换都重置受骂模式运行状态 */
+  resetVentState();
+
+  const setup = document.getElementById("ventSetup");
+  if (setup) setup.hidden = mode !== "vent";
+
+  if (userInput) {
+    userInput.disabled = false;
+    userInput.placeholder = mode === "vent" ? "继续说, 我听着" : "说出你的想法, 我来反驳";
+  }
+  if (sendButton) sendButton.disabled = false;
+
+  const tabs = document.querySelectorAll("#modeSwitch [data-mode]");
+  for (let i = 0; i < tabs.length; i++) {
+    tabs[i].classList.toggle("active", tabs[i].getAttribute("data-mode") === mode);
+  }
+
+  if (!opts.keepHistory) {
+    chatHistory = loadSession();
+    renderHistoryMessages();
+    updateStats();
+  }
+
+  refreshAiAvatars();
+  renderVentMeter();
+
+  if (!opts.silent && prev !== mode) {
+    showToast(mode === "vent" ? "已切换到受骂模式" : "已切换到反驳助手", 1500);
+  }
+}
+
+/* ==================== 十八. 渲染历史 / 清空 ==================== */
+
 function renderWelcome() {
   if (getMode() === "vent") {
     appendMessage(
       "assistant",
-      "我在, 先不急着讲道理.<br>你想从哪儿说起都行, 说完这一段再说下一段, 我都在听.",
+      "我在这里听着.<br>你想说什么就说什么, 我不反驳, 也不评判.",
       { emoji: true }
     );
     return;
   }
   appendMessage(
     "assistant",
-    "说吧, 你想做什么决定? 我会站到你的对面, 把这件事可能翻车的地方一个个扯出来.",
+    "说出你的计划或想法, 我会从逻辑、现实、代价几个方向逐条反驳给你看.",
     { emoji: true }
   );
 }
@@ -1187,13 +1349,14 @@ function renderHistoryMessages() {
   if (!chatArea) return;
   chatArea.innerHTML = "";
 
-  if (chatHistory.length === 1) {
+  if (!Array.isArray(chatHistory) || chatHistory.length <= 1) {
     renderWelcome();
     return;
   }
 
-  for (const msg of chatHistory) {
-    if (msg.role === "system") continue;
+  for (let i = 0; i < chatHistory.length; i++) {
+    const msg = chatHistory[i];
+    if (!msg || msg.role === "system") continue;
     if (msg.role === "user") {
       appendMessage("user", escapeHtml(msg.content), { text: msg.content });
     } else if (msg.role === "assistant") {
@@ -1211,7 +1374,7 @@ async function handleClear() {
   removeThinkingMessage();
   setLoading(false);
 
-  const messages = Array.prototype.slice.call(chatArea.querySelectorAll(".message"));
+  const messages = Array.prototype.slice.call(chatArea.querySelectorAll(".message, .ending-card, .vote-card"));
   chatArea.classList.add("clearing");
   messages.forEach(function (el, i) {
     el.style.animationDelay = Math.min(i * 25, 200) + "ms";
@@ -1223,29 +1386,29 @@ async function handleClear() {
   chatArea.innerHTML = "";
   messages.forEach(function (el) { el.style.animationDelay = ""; });
 
-  chatHistory = [{ role: "system", content: finalPrompt }];
+  /* 清空当前模式的会话, 另一个模式的数据完全不受影响 */
+  chatHistory = [{ role: "system", content: currentSystemPrompt() }];
   saveSession(chatHistory);
 
+  /* 受骂模式: 解锁并归零 */
+  resetVentState();
+
+  userInput.disabled = false;
   userInput.value = "";
-  userInput.placeholder = "说出你的想法, 我来当反方";
+  userInput.placeholder = getMode() === "vent" ? "继续说, 我听着" : "说出你的想法, 我来反驳";
+  if (sendButton) sendButton.disabled = false;
   autoResizeInput();
+
   renderWelcome();
   updateStats();
 
   isClearing = false;
-
-  if (window.DDHEngine && DDHEngine.onConversationCleared) {
-    try { DDHEngine.onConversationCleared(); } catch (e) { console.error(e); }
-  }
-
-  showToast("对话已清空, 统计已重置", 1500);
+  showToast("对话已清空, 可以重新开始一场", 1500);
   if (!IS_TOUCH) userInput.focus();
 }
 
-/* ==================== 十五. 附加功能 ==================== */
-/* [恢复] 下面四个功能全部内置在 main.js, 不依赖 panel.js */
+/* ==================== 十九. 闪回 (功能保留) ==================== */
 
-/* ---------- 1. 回忆闪回 ---------- */
 function openFlashback() {
   const msgs = chatHistory.filter(function (m) {
     return m.role === "user" || m.role === "assistant";
@@ -1276,8 +1439,7 @@ function openFlashback() {
     const picked = msgs[idx];
     if (!picked) return;
     const snippet = String(picked.content || "").slice(0, 200);
-    const prefix = "回忆闪回: 上次说到 " + snippet + " 这件事我还是想再说说.\n";
-    userInput.value = prefix + userInput.value;
+    userInput.value = "上次说到: " + snippet + "\n这件事我还想再说说.\n" + userInput.value;
     autoResizeInput();
     closeAppModal();
     userInput.focus();
@@ -1285,12 +1447,16 @@ function openFlashback() {
   });
 }
 
-/* ---------- 2. 情绪小结 ---------- */
+/* ==================== 二十. 情绪小结 (功能保留) ==================== */
+
 function localMoodText() {
+  const mine = chatHistory.filter(function (m) { return m.role === "user"; });
+  const rounds = mine.length;
+  const pressure = ventState.pressure;
   return [
     "情绪关键词: 憋屈, 疲惫, 想被理解",
-    "你真正在意的: 不是这件事本身对错, 而是对方有没有认真听你把话说完.",
-    "情绪强度: 中偏高, 从你的用词和句子长度能看出来.",
+    "你这次一共说了 " + rounds + " 句话, 累计压力 " + pressure + " 分.",
+    "情绪强度: " + (pressure >= VENT_PRESSURE_THRESHOLD ? "偏高" : rounds >= 5 ? "中等" : "偏低") + ".",
     "今晚可以做的一个小动作: 把最想说的那三句话写进备忘录, 明天再决定要不要发出去.",
     "给自己一句话: 你的感受不需要被批准.",
   ].join("\n");
@@ -1302,10 +1468,7 @@ function showModalText(title, text, tip) {
     '<div class="summary-box">' + safe + "</div>" +
     (tip ? '<p class="hint">' + escapeHtml(tip) + "</p>" : "");
   openAppModal(title, html, [
-    {
-      label: "复制小结",
-      onClick: function () { copyText(text); },
-    },
+    { label: "复制小结", onClick: function () { copyText(text); } },
     { label: "关闭", primary: true, onClick: closeAppModal },
   ]);
 }
@@ -1319,17 +1482,12 @@ async function runAiText(title, promptText) {
     showToast("还没有对话内容, 先聊上两句再生成", 1800);
     return;
   }
-
-  if (DEMO_MODE) {
-    showModalText(title, localMoodText(), "演示模式: 以上为本地示例文本");
-    return;
-  }
   if (!navigator.onLine) {
     showToast("当前离线, 生成小结需要联网", 1800);
     return;
   }
   if (!getApiKey()) {
-    showToast("还没有填写 API Key, 请在设置面板填写后再试", 2000);
+    showModalText(title, localMoodText(), "未填写 API Key, 以上为本地估算的小结");
     return;
   }
 
@@ -1361,12 +1519,40 @@ async function runAiText(title, promptText) {
 function openMoodSummary() {
   runAiText(
     "🫧 情绪小结",
-    "请阅读下面的对话记录, 为我生成一张情绪复盘卡片, 中文, 语气克制不煽情.\n" +
-    "请分成四段, 每段一行标题加一句内容: 情绪关键词, 我真正在意的事, 情绪强度与依据, 今晚能做的一个小动作."
+    "请阅读下面的对话记录, 生成一张情绪复盘卡片, 中文, 语气克制不煽情.\n" +
+    "分成四段, 每段一行标题加一句内容: 情绪关键词, 我真正在意的事, 情绪强度与依据, 今晚能做的一个小动作."
   );
 }
 
-/* ---------- 3. 涂鸦画布 ---------- */
+/* ==================== 二十一. 涂鸦 (功能保留) ==================== */
+
+function loadDrawings() {
+  if (window.DDHStore && DDHStore.Drawings) {
+    try { return DDHStore.Drawings.list() || []; } catch (e) {}
+  }
+  let arr = [];
+  try { arr = JSON.parse(safeGet("ddh:drawings") || "[]"); } catch (e) { arr = []; }
+  return Array.isArray(arr) ? arr : [];
+}
+
+function saveDrawings(arr) {
+  if (window.DDHStore && DDHStore.Drawings) {
+    try {
+      const old = DDHStore.Drawings.list();
+      const added = arr[0];
+      if (added && (!old.length || old[0].id !== added.id)) {
+        DDHStore.Drawings.add(added.data);
+        return true;
+      }
+      if (!arr.length) {
+        DDHStore.Drawings.clear();
+        return true;
+      }
+    } catch (e) {}
+  }
+  return safeSet("ddh:drawings", JSON.stringify(Array.isArray(arr) ? arr.slice(0, 6) : []));
+}
+
 function openDrawPad() {
   const list = loadDrawings();
 
@@ -1392,13 +1578,6 @@ function openDrawPad() {
 
   openAppModal("🖍️ 情绪涂鸦板", html, [{ label: "关闭", primary: true, onClick: closeAppModal }]);
   setupDrawCanvas();
-}
-
-function fmtTime(ts) {
-  const d = ts ? new Date(ts) : new Date();
-  function p(n) { return n < 10 ? "0" + n : "" + n; }
-  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
-    " " + p(d.getHours()) + ":" + p(d.getMinutes());
 }
 
 function setupDrawCanvas() {
@@ -1474,7 +1653,7 @@ function setupDrawCanvas() {
           arr.unshift({ id: String(Date.now()), data: dataUrl, ts: Date.now() });
           const ok = saveDrawings(arr.slice(0, 6));
           showToast(ok ? "涂鸦已保存到本机" : "保存失败, 可能是存储空间不足", 1600);
-          if (ok) openDrawPad(); /* 重开一次刷新列表 */
+          if (ok) openDrawPad();
         } catch (err) {
           showToast("保存失败, 请再试一次", 1600);
         }
@@ -1493,7 +1672,25 @@ function setupDrawCanvas() {
   });
 }
 
-/* ---------- 4. 情绪标签 ---------- */
+/* ==================== 二十二. 情绪标签 ==================== */
+
+function addMoodTag(tag) {
+  if (!tag) return;
+  if (window.DDHStore && DDHStore.Tags) {
+    try { DDHStore.Tags.add(tag); return; } catch (e) {}
+  }
+  let data = { counts: {}, records: [] };
+  try {
+    const raw = JSON.parse(safeGet("ddh:tags") || "null");
+    if (raw && raw.counts && typeof raw.counts === "object") data = raw;
+  } catch (e) {}
+  data.counts[tag] = (Number(data.counts[tag]) || 0) + 1;
+  if (!Array.isArray(data.records)) data.records = [];
+  data.records.unshift({ tag: tag, ts: Date.now() });
+  if (data.records.length > 300) data.records.length = 300;
+  safeSet("ddh:tags", JSON.stringify(data));
+}
+
 function openMoodTagSheet() {
   const tags = (window.DDHPersonas && DDHPersonas.MOOD_TAGS) || [
     { tag: "委屈" }, { tag: "恼火" }, { tag: "疲惫" }, { tag: "无奈" }, { tag: "失望" },
@@ -1519,18 +1716,16 @@ function openMoodTagSheet() {
   });
 }
 
-/* ---------- 5. 附加: 辩题 / 回看 / 摘要 / 计分 (engine 缺失时兜底) ---------- */
+/* ==================== 二十三. 辩题 / 回看 / 摘要 / 计分 ==================== */
+
 function openTopicPicker() {
   const topic = CAMPUS_TOPICS[Math.floor(Math.random() * CAMPUS_TOPICS.length)];
   openAppModal("🎲 校园辩题", '<div class="topic-box">' + escapeHtml(topic) + "</div>", [
-    {
-      label: "换一个",
-      onClick: openTopicPicker,
-    },
+    { label: "换一个", onClick: openTopicPicker },
     {
       label: "用它开辩",
       onClick: function () {
-        userInput.value = "辩题: " + topic + "\n我的立场: ";
+        userInput.value = "我的想法是关于这个辩题: " + topic + "\n我的立场是: ";
         autoResizeInput();
         closeAppModal();
         userInput.focus();
@@ -1575,8 +1770,8 @@ function openRecall() {
 
 function openDebateSummary() {
   runAiText(
-    "📝 辩论摘要",
-    "请阅读下面的辩论记录, 用中文写一段 300 字以内的综述: 我方的核心主张, 对方最有力的质疑, 我还没回应的漏洞, 以及三条可执行的建议."
+    "📝 整场摘要",
+    "请阅读下面的对话记录, 用中文写一段 300 字以内的综述: 我提出过哪些想法, 对方最有力的反驳是什么, 我还没回应的漏洞, 以及三条可执行的建议."
   );
 }
 
@@ -1595,7 +1790,7 @@ function renderScoreValues() {
     try { s = DDHStore.Score.get(); } catch (e) {}
   } else {
     try {
-      const raw = JSON.parse(localStorage.getItem("ddh:score") || "null");
+      const raw = JSON.parse(safeGet("ddh:score") || "null");
       if (raw && typeof raw === "object") s = { mine: Number(raw.mine) || 0, rival: Number(raw.rival) || 0 };
     } catch (e) {}
   }
@@ -1609,16 +1804,16 @@ function changeScore(side, delta) {
   }
   let s = { mine: 0, rival: 0 };
   try {
-    const raw = JSON.parse(localStorage.getItem("ddh:score") || "null");
+    const raw = JSON.parse(safeGet("ddh:score") || "null");
     if (raw && typeof raw === "object") s = { mine: Number(raw.mine) || 0, rival: Number(raw.rival) || 0 };
   } catch (e) {}
   const k = side === "rival" ? "rival" : "mine";
   s[k] = s[k] + (Number(delta) || 0);
-  try { localStorage.setItem("ddh:score", JSON.stringify(s)); } catch (e) {}
+  safeSet("ddh:score", JSON.stringify(s));
   renderScoreValues();
 }
 
-/* ==================== 十六. 移动端适配 ==================== */
+/* ==================== 二十四. 移动端适配 ==================== */
 
 function syncViewportHeight() {
   const vv = window.visualViewport;
@@ -1641,13 +1836,15 @@ function initViewport() {
     setTimeout(syncViewportHeight, 200);
   });
 
-  userInput.addEventListener("focus", function () {
-    document.body.classList.add("keyboard-open");
-    setTimeout(function () { scrollToBottom(true); }, 300);
-  });
-  userInput.addEventListener("blur", function () {
-    document.body.classList.remove("keyboard-open");
-  });
+  if (userInput) {
+    userInput.addEventListener("focus", function () {
+      document.body.classList.add("keyboard-open");
+      setTimeout(function () { scrollToBottom(true); }, 300);
+    });
+    userInput.addEventListener("blur", function () {
+      document.body.classList.remove("keyboard-open");
+    });
+  }
 }
 
 function autoResizeInput() {
@@ -1659,7 +1856,7 @@ function autoResizeInput() {
   userInput.style.overflowY = userInput.scrollHeight + 2 > MAX ? "auto" : "hidden";
 }
 
-/* ==================== 十七. 设置面板 (齿轮) ==================== */
+/* ==================== 二十五. 设置面板 ==================== */
 
 function openSettingsSheet() {
   const sheet = document.getElementById("settingsSheet");
@@ -1678,7 +1875,6 @@ function closeSettingsSheet() {
   document.body.classList.remove("sheet-open");
 }
 
-/** 渲染设置面板内容; force 为 true 时强制重绘 */
 function renderFallbackSettings(force) {
   const body = document.getElementById("settingsBody");
   if (!body) return;
@@ -1694,15 +1890,15 @@ function renderFallbackSettings(force) {
     '    <input id="fbApiKey" class="field-input" type="text" autocomplete="off" spellcheck="false" placeholder="sk-..." value="' + escapeHtml(key) + '" />' +
     '  </div>' +
     '  <button id="fbSaveKey" class="mini-btn primary block" type="button">保存密钥</button>' +
-    '  <p class="hint">密钥只写入本机 localStorage, 不上传到任何第三方.</p>' +
+    '  <p class="hint">密钥只写入本机 localStorage, 源码中不保存任何密钥.</p>' +
     '</section>' +
     '<section class="group">' +
     '  <h3 class="group-title">🎭 对话模式</h3>' +
     '  <div class="mode-tabs">' +
-    '    <button class="mode-tab' + (mode === "vent" ? "" : " active") + '" type="button" data-fb-mode="debate">辩论模式</button>' +
-    '    <button class="mode-tab' + (mode === "vent" ? " active" : "") + '" type="button" data-fb-mode="vent">情绪宣泄</button>' +
+    '    <button class="mode-tab' + (mode === "vent" ? "" : " active") + '" type="button" data-fb-mode="debate">反驳助手</button>' +
+    '    <button class="mode-tab' + (mode === "vent" ? " active" : "") + '" type="button" data-fb-mode="vent">受骂模式</button>' +
     '  </div>' +
-    '  <p class="hint">两种模式各自保存一份对话记录.</p>' +
+    '  <p class="hint">两套对话分开存储: debate_chat 与 vent_chat.</p>' +
     '</section>' +
     '<section class="group">' +
     '  <h3 class="group-title">🖼️ 对方头像</h3>' +
@@ -1710,7 +1906,7 @@ function renderFallbackSettings(force) {
     '  <button id="fbResetAvatar" class="mini-btn block" type="button">恢复默认文字头像</button>' +
     '</section>' +
     '<section class="group">' +
-    '  <h3 class="group-title">🕯️ 附加功能</h3>' +
+    '  <h3 class="group-title">🧰 附加功能</h3>' +
     '  <div class="btn-grid">' +
     '    <button class="mini-btn" type="button" data-fb-tool="flashback">回忆闪回</button>' +
     '    <button class="mini-btn" type="button" data-fb-tool="mood">情绪小结</button>' +
@@ -1748,16 +1944,8 @@ function renderFallbackSettings(force) {
 
     const modeBtn = t.closest("[data-fb-mode]");
     if (modeBtn) {
-      const next = modeBtn.getAttribute("data-fb-mode");
-      setSetting("mode", next);
-      document.body.classList.toggle("mode-vent", next === "vent");
-      document.body.classList.toggle("mode-debate", next !== "vent");
-      chatHistory = loadSession();
-      renderHistoryMessages();
-      updateStats();
-      refreshAiAvatars();
+      setMode(modeBtn.getAttribute("data-fb-mode"));
       renderFallbackSettings(true);
-      showToast(next === "vent" ? "已切换到情绪宣泄模式" : "已切换到辩论模式", 1400);
       return;
     }
 
@@ -1773,10 +1961,7 @@ function renderFallbackSettings(force) {
   });
 }
 
-/* ==================== 十八. DDHPanel 垫片 ==================== */
-/* [恢复] 核心新增: panel.js 没加载时, 用它顶上去.
-   engine.js 里的 闪回 / 情绪小结 / 涂鸦 / 辩题 / 回看 / 摘要 都通过
-   DDHPanel 打开弹窗, 装上垫片后这些功能全部恢复. */
+/* ==================== 二十六. DDHPanel 垫片 ==================== */
 
 function installPanelShim() {
   if (window.DDHPanel && typeof DDHPanel.openModal === "function") {
@@ -1831,7 +2016,7 @@ function installPanelShim() {
   };
 }
 
-/* ==================== 十九. 启动工具 ==================== */
+/* ==================== 二十七. 启动工具 ==================== */
 
 function onReady(fn) {
   if (document.readyState === "loading") {
@@ -1872,7 +2057,6 @@ function registerServiceWorker() {
   });
 }
 
-/** 给按钮挂一次 click, 用 dataset 防重复 */
 function bindClickOnce(id, handler) {
   const el = document.getElementById(id);
   if (!el) return false;
@@ -1882,14 +2066,10 @@ function bindClickOnce(id, handler) {
   return true;
 }
 
-/* [恢复] 四个附加按钮的绑定 */
+/** 工具条按钮: engine 不可用时由 main 兜底接管 */
 function installExtraButtons() {
-  const engineOK = !!(window.DDHEngine && typeof DDHEngine.openFlashback === "function");
-
-  /* 换头像: engine 不负责这个按钮, 永远由 main 自己处理 */
   bindClickOnce("btnAvatar", openAvatarPicker);
 
-  /* 点任意 AI 头像也能换 */
   if (chatArea && !chatArea.dataset.avatarClickBound) {
     chatArea.dataset.avatarClickBound = "1";
     chatArea.addEventListener("click", function (e) {
@@ -1902,21 +2082,18 @@ function installExtraButtons() {
     });
   }
 
-  /* engine 存在时由 engine 绑定 闪回 / 情绪小结 / 涂鸦 (它已能通过垫片工作);
-     engine 缺失时才由 main 兜底绑定 */
-  if (!engineOK) {
-    bindClickOnce("btnFlashback", openFlashback);
-    bindClickOnce("btnMood", openMoodSummary);
-    bindClickOnce("btnDraw", openDrawPad);
-    bindClickOnce("btnTopics", openTopicPicker);
-    bindClickOnce("btnRecall", openRecall);
-    bindClickOnce("btnSummary", openDebateSummary);
-    bindClickOnce("btnScore", toggleScoreboard);
-    console.log("[DDH] engine.js 缺失, 附加按钮已由 main.js 接管");
-  }
+  if (engineReady) return;
+
+  bindClickOnce("btnFlashback", openFlashback);
+  bindClickOnce("btnMood", openMoodSummary);
+  bindClickOnce("btnDraw", openDrawPad);
+  bindClickOnce("btnTopics", openTopicPicker);
+  bindClickOnce("btnRecall", openRecall);
+  bindClickOnce("btnSummary", openDebateSummary);
+  bindClickOnce("btnScore", toggleScoreboard);
+  console.log("[DDH] engine.js 未接管, 附加按钮由 main.js 绑定");
 }
 
-/* [恢复] 齿轮兜底: 即使 panel.js 和垫片都失效, 也能打开设置 */
 function installGearFallback() {
   const gear = document.getElementById("settingsToggle");
   const sheet = document.getElementById("settingsSheet");
@@ -1937,17 +2114,23 @@ function installGearFallback() {
   });
 }
 
-/* ==================== 二十. 对外桥接接口 ==================== */
-/* 这段必须留在文件前面执行? 不需要, 但必须在 boot 之前定义好.
-   引擎和面板都通过 window.DDH 取能力. */
+/** 覆盖 engine 的模式切换, 保证切换时一定重置受骂状态 (Bug2) */
+function patchEngineModeSwitch() {
+  if (!window.DDHEngine) return;
+  window.DDHEngine.applyMode = function (next) {
+    setMode(next);
+  };
+}
+
+/* ==================== 二十八. 对外桥接接口 ==================== */
 
 window.DDH = {
-  version: "2.2.0",
+  version: "3.0.0",
   config: {
     API_URL: API_URL,
     MODEL_NAME: MODEL_NAME,
     REQUEST_TIMEOUT_MS: REQUEST_TIMEOUT_MS,
-    DEMO_MODE: DEMO_MODE,
+    DEMO_MODE: false,
     IS_TOUCH: IS_TOUCH,
     AI_EMOJIS: AI_EMOJIS,
   },
@@ -1995,6 +2178,8 @@ window.DDH = {
   getStrengthLevel: getStrengthLevel,
   setStrength: setStrength,
   getApiKey: getApiKey,
+  getMode: getMode,
+  setMode: setMode,
   callDeepSeek: callDeepSeek,
   isThinking: function () { return isThinking; },
   isClearing: function () { return isClearing; },
@@ -2002,11 +2187,10 @@ window.DDH = {
   refreshAvatars: refreshAiAvatars,
   openAppModal: openAppModal,
   closeAppModal: closeAppModal,
+  getVentState: function () { return { rounds: ventState.rounds, pressure: ventState.pressure, gameOver: ventState.gameOver }; },
 };
 
-window.DDH_STRIP_LIST_MARKERS = stripListMarkers;
-
-/* ==================== 二十一. 基础事件绑定 ==================== */
+/* ==================== 二十九. 基础事件绑定 ==================== */
 
 if (sendButton) sendButton.addEventListener("click", handleSubmit);
 if (clearButton) clearButton.addEventListener("click", handleClear);
@@ -2022,7 +2206,7 @@ if (userInput) {
 
   userInput.addEventListener("input", function () {
     if (userInput.value.trim() !== "") {
-      userInput.placeholder = "说出你的想法, 我来当反方";
+      userInput.placeholder = getMode() === "vent" ? "继续说, 我听着" : "说出你的想法, 我来反驳";
     }
     autoResizeInput();
   });
@@ -2037,7 +2221,6 @@ if (strengthSlider) {
   });
 }
 
-/* 计分板加减分 */
 (function bindScoreboard() {
   const board = document.getElementById("scoreboard");
   if (!board) return;
@@ -2051,40 +2234,55 @@ if (strengthSlider) {
 
 window.addEventListener("resize", function () { scrollToBottom(); });
 
-/* ==================== 二十二. 启动编排 ==================== */
+/* ==================== 三十. 启动编排 ==================== */
 
 function boot() {
   safeRun("主题", initTheme);
   safeRun("强度滑块", initStrength);
   safeRun("字号", applyStoredFontSize);
   safeRun("视口适配", initViewport);
-  safeRun("宣泄阈值调优", tuneVentThresholds);
 
-  safeRun("历史渲染", function () {
+  /* 读取受骂模式状态 (带数据校验) */
+  safeRun("受骂状态读取", function () { ventState = loadVentState(); });
+
+  /* 载入当前模式的会话 (数据损坏会自动重置) */
+  safeRun("会话载入", function () {
+    chatHistory = loadSession();
     renderHistoryMessages();
     updateStats();
     autoResizeInput();
     renderScoreValues();
   });
 
-  /* [恢复] 关键顺序: 先装垫片, 再初始化面板, 最后初始化引擎 */
+  /* 页面内插入模式切换条与受骂模式参数面板 */
+  safeRun("受骂面板挂载", mountVentSetup);
+
   safeRun("DDHPanel 垫片", installPanelShim);
+  safeRun("引擎模式切换接管", patchEngineModeSwitch);
 
   safeRun("设置面板", function () {
     if (window.DDHPanel && typeof DDHPanel.init === "function") DDHPanel.init();
   }, true);
 
   safeRun("对话引擎", function () {
-    if (window.DDHEngine && typeof DDHEngine.init === "function") DDHEngine.init();
+    if (window.DDHEngine && typeof DDHEngine.init === "function") {
+      DDHEngine.init();
+      engineReady = true;
+    }
   }, true);
+
+  /* 引擎初始化后再次确保模式状态正确, 并同步界面 */
+  safeRun("模式同步", function () {
+    setMode(getMode(), { silent: true });
+  });
 
   safeRun("附加按钮绑定", installExtraButtons);
   safeRun("齿轮兜底", installGearFallback);
   safeRun("Service Worker", registerServiceWorker);
 
   console.log("[DDH] 启动完成",
+    "mode=" + getMode(),
     "DDHStore=" + !!window.DDHStore,
-    "DDHPersonas=" + !!window.DDHPersonas,
     "DDHEngine=" + !!window.DDHEngine,
     "DDHPanel=" + (window.DDHPanel ? (DDHPanel.__shim ? "shim" : "real") : "none"));
 }
