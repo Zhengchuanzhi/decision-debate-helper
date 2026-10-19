@@ -1,19 +1,20 @@
 /* =========================================================
-   决策辩论助手 / js/main.js  (v3.4.0)
+   决策辩论助手 / js/main.js  (v3.5.0)
    ---------------------------------------------------------
    两套模式严格隔离, 参数绝不串用:
 
    [反驳助手] 只用: DEBATE_SYSTEM_PROMPT / 反驳强度 / 辩论回合统计
               无压力计分, 无回合上限, 无 gameOver, 无结局卡片 (Bug9)
    [受骂模式] 只用: VENT_SYSTEM_PROMPT / 背景人设 / 压力计分 / 轮次语气
-              不读取任何反驳强度与辩论参数 (Bug7)
+              不读取任何反驳强度与辩论参数 (Bug7) 并隐藏辩论 UI (Bug15)
 
-   Bug1  提示词隔离      Bug2  切模式重置      Bug3+8 未满10轮绝不结束
-   Bug4  回复全部动态生成 Bug5  存储校验        Bug6+10 背景按钮永不禁用
-   Bug7  参数隔离        Bug9  辩论永不结束
-   Bug11 辩论语气真人化  Bug12 受骂轮次语气过渡 Bug13 中途绝不认错
+   Bug1  提示词隔离        Bug2  切模式重置       Bug3+8 未满10轮绝不结束
+   Bug4  回复全部动态生成   Bug5  存储校验         Bug6+10 背景按钮永不禁用
+   Bug7  参数隔离          Bug9  辩论永不结束     Bug11 辩论语气真人化
+   Bug12 受骂轮次语气过渡   Bug13 中途绝不认错     Bug14 手机窄屏压缩顶部
+   Bug15 模式联动隐藏辩论 UI                     Bug16 全局顶部面板一键折叠
 
-   存储: debate_chat / vent_chat / vent_character_bg / vent_state
+   存储: debate_chat / vent_chat / vent_character_bg / vent_state / ui_panel_collapse
    保留: 闪回 / 情绪小结 / 涂鸦 / 换头像 / 强度滑块 / 明暗主题
    安全: API Key 只从本机设置读取, 源码内无任何密钥
    ========================================================= */
@@ -32,6 +33,7 @@ const DEBATE_CHAT_KEY = "debate_chat";
 const VENT_CHAT_KEY = "vent_chat";
 const VENT_BG_KEY = "vent_character_bg";
 const VENT_STATE_KEY = "vent_state";
+const PANEL_COLLAPSE_KEY = "ui_panel_collapse";
 const THEME_KEY = "harness_debate_theme";
 const STRENGTH_KEY = "harness_debate_strength";
 
@@ -78,11 +80,9 @@ const VENT_ENDING_SYSTEM_PROMPT = `你处于受骂模式的结局时刻。
 
 /* =========================================================
    三. 辩论专属参数模块 —— 仅反驳助手读取 (Bug7 / Bug9 / Bug11)
-   受骂模式的任何代码路径都不允许引用本模块
    ========================================================= */
 
 const DEBATE_PARAMS = {
-  /* 反驳强度三档 */
   levels: [
     {
       name: "温和辩论",
@@ -116,17 +116,12 @@ const DEBATE_PARAMS = {
 
 /* =========================================================
    四. 受骂专属参数模块 —— 仅受骂模式读取 (Bug7 / Bug8 / Bug12 / Bug13)
-   反驳助手的任何代码路径都不允许引用本模块
    ========================================================= */
 
 const VENT_PARAMS = {
-  /* 硬性底线: 未满 10 轮发言绝不判定结束 (Bug3 / Bug8) */
   minRounds: 10,
-  /* 10 轮之后, 压力达到该值才结束 */
   pressureThreshold: 90,
-  /* 受骂模式固定温度, 与反驳强度无关 */
   temperature: 0.7,
-  /* 结局收尾温度 */
   endingTemperature: 0.7,
 
   /* 按轮次分段的语气状态 (Bug12) */
@@ -184,10 +179,7 @@ function safeRemove(key) {
   try { localStorage.removeItem(key); } catch (e) {}
 }
 
-/**
- * 历史对话结构校验 (Bug5)
- * 必须是数组, 首条 system, 其余 role 合法且 content 为非空字符串
- */
+/** 历史对话结构校验 (Bug5) */
 function isValidHistory(arr) {
   if (!Array.isArray(arr) || !arr.length) return false;
   const first = arr[0];
@@ -216,13 +208,28 @@ function readHistory(key, systemText) {
     return [{ role: "system", content: systemText }];
   }
 
-  /* 首条 system 一律替换成当前模式人设, 从根上杜绝串岗 (Bug1) */
   parsed[0] = { role: "system", content: systemText };
   return parsed;
 }
 
 function writeHistory(key, history) {
   try { safeSet(key, JSON.stringify(history)); } catch (e) {}
+}
+
+/** 顶部面板折叠状态 (Bug16): 只接受 "true" / "false" */
+function loadPanelCollapsed() {
+  const raw = safeGet(PANEL_COLLAPSE_KEY);
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (raw !== null && raw !== "") {
+    console.warn("[DDH] 折叠状态数据异常, 已重置:", PANEL_COLLAPSE_KEY);
+    safeRemove(PANEL_COLLAPSE_KEY);
+  }
+  return false;
+}
+
+function savePanelCollapsed(value) {
+  safeSet(PANEL_COLLAPSE_KEY, value ? "true" : "false");
 }
 
 /* ==================== 六. 设置读取兼容层 ==================== */
@@ -270,7 +277,7 @@ function getMode() {
 function isDebateMode() { return getMode() !== "vent"; }
 function isVentMode() { return getMode() === "vent"; }
 
-/** API Key 只从本机设置读取, 源码里没有硬编码密钥 */
+/** API Key 只从本机设置读取 */
 function getApiKey() {
   return String(getSetting("apiKey", "") || "").trim();
 }
@@ -376,9 +383,7 @@ function resetVentState() {
   if (userInput) userInput.disabled = false;
   if (sendButton) sendButton.disabled = false;
 
-  /* Bug6 / Bug10: 背景面板按钮永远保持可点 */
   forceBgToggleEnabled();
-
   renderVentMeter();
 }
 
@@ -406,7 +411,11 @@ let isThinking = false;
 let isClearing = false;
 let sessionEpoch = 0;
 let engineReady = false;
-let bgPanelOpen = false;
+
+/* 顶部 UI 状态 */
+let bgPanelOpen = false;            /* 背景小面板展开状态 */
+let panelCollapsed = false;         /* 顶部总折叠状态 (Bug16) */
+let scoreboardOpen = false;         /* 计分板展开状态 */
 
 /* 反驳强度下标: 只属于辩论模块 (Bug7) */
 let currentStrength = (function () {
@@ -1008,7 +1017,7 @@ function toggleTheme() {
 }
 
 /* =========================================================
-   十六. 反驳强度 —— 只属于辩论模式 (Bug7)
+   十六. 反驳强度 —— 只属于辩论模式 (Bug7 / Bug15)
    ========================================================= */
 
 function getStrengthLevel() {
@@ -1050,7 +1059,7 @@ function initStrength() {
 }
 
 /* =========================================================
-   十七. 辩论统计 —— 只属于辩论模式 (Bug7 / Bug9)
+   十七. 辩论统计 —— 只属于辩论模式 (Bug7 / Bug9 / Bug15)
    ========================================================= */
 
 function updateStats(animate) {
@@ -1304,13 +1313,6 @@ async function handleSubmit() {
    二十一. 受骂模式结局判定 —— 三重硬保护 (Bug3 / Bug8 / Bug9 / Bug13)
    ========================================================= */
 
-/**
- * 是否具备结束资格, 必须全部满足:
- * 1. 当前是受骂模式 (辩论模式永远为 false)
- * 2. 尚未结束
- * 3. 用户发言轮次 >= 10 (硬性底线)
- * 4. 压力达到阈值
- */
 function canEndVentSession() {
   if (!isVentMode()) return false;
   if (!ventState || ventState.gameOver) return false;
@@ -1319,7 +1321,7 @@ function canEndVentSession() {
   return true;
 }
 
-/** 结局时动态生成一句认错收尾, 生成失败就跳过, 绝不写死台词 (Bug4) */
+/** 结局时动态生成认错收尾, 生成失败就跳过, 绝不写死台词 (Bug4) */
 async function requestVentEnding() {
   try {
     const history = chatHistory.filter(function (m) {
@@ -1329,22 +1331,20 @@ async function requestVentEnding() {
     const messages = [{ role: "system", content: buildVentEndingPrompt() }];
     history.forEach(function (m) { messages.push({ role: m.role, content: m.content }); });
 
-    const reply = await callDeepSeek(messages, VENT_PARAMS.endingTemperature);
-    return reply;
+    return await callDeepSeek(messages, VENT_PARAMS.endingTemperature);
   } catch (err) {
     console.warn("[DDH] 结局收尾生成失败, 跳过:", err && err.message);
     return "";
   }
 }
 
-/** 执行结局判定, 不满足条件直接返回, 什么都不做 */
 async function finalizeVentTurn() {
   if (!canEndVentSession()) return;
 
   ventState.gameOver = true;
   saveVentState();
+  renderVentMeter();
 
-  /* 轮次与压力先落地, 再把认错那句话说出口 */
   const closing = await requestVentEnding();
   if (closing && isVentMode()) {
     chatHistory.push({ role: "assistant", content: closing });
@@ -1390,13 +1390,11 @@ function renderGameOverCard(rounds, pressure) {
 
 /* ==================== 二十二. 背景按钮永久可点 (Bug10) ==================== */
 
-/** 强制把背景展开按钮设为可点, 任何场景都调用一次 */
 function forceBgToggleEnabled() {
   const btn = document.getElementById("bgToggleBtn");
   if (btn && btn.disabled) btn.disabled = false;
 }
 
-/** 监听 disabled 属性, 一旦被置为 true 立刻改回 false (Bug10) */
 function guardBgToggle() {
   const btn = document.getElementById("bgToggleBtn");
   if (!btn) return;
@@ -1420,19 +1418,151 @@ function guardBgToggle() {
   }
 }
 
-/* ==================== 二十三. 页面注入: 模式切换 / 背景面板 (Bug6 / Bug10) ==================== */
+/* =========================================================
+   二十三. 顶部 UI: 折叠开关 / 模式切换 / 背景面板   (Bug6/10/14/15/16)
+   ========================================================= */
 
-function mountVentFeatures() {
+/** 统一的显隐控制: 所有顶部区域的可见性都从这里算 */
+function applyUiState() {
+  const collapsed = panelCollapsed;
+  const vent = isVentMode();
+
+  /* Bug16: 全局折叠按钮文案 */
+  const collapseBtn = document.getElementById("collapseBtn");
+  if (collapseBtn) {
+    collapseBtn.textContent = collapsed ? "展开全部设置面板" : "收起全部设置面板";
+    collapseBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    collapseBtn.disabled = false;
+  }
+
+  setHiddenById("modeSwitch", collapsed);
+  setHiddenById("bgToggleRow", collapsed);
+  setHiddenById("bgPanel", collapsed || !bgPanelOpen);
+  setHiddenById("ventMeterBox", collapsed || !vent);
+  setHiddenById("toolStrip", collapsed);
+  setHiddenById("scoreboard", collapsed || !scoreboardOpen);
+
+  /* Bug15: 辩论 UI 只在反驳助手模式显示; Bug16: 折叠时也隐藏 */
+  const controlPanel = document.querySelector(".control-panel");
+  if (controlPanel) {
+    const hide = collapsed || vent;
+    controlPanel.hidden = hide;
+    controlPanel.style.display = hide ? "none" : "";
+  }
+
+  forceBgToggleEnabled();
+}
+
+function setHiddenById(id, hidden) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.hidden = !!hidden;
+}
+
+/** Bug16: 一键折叠 / 展开全部顶部面板, 状态持久化 */
+function togglePanelCollapse(force) {
+  panelCollapsed = typeof force === "boolean" ? force : !panelCollapsed;
+  savePanelCollapsed(panelCollapsed);
+  applyUiState();
+  scrollToBottom();
+  showToast(panelCollapsed ? "顶部面板已收起" : "顶部面板已展开", 1200);
+}
+
+/** Bug14: 手机窄屏压缩顶部高度, 桌面端不受影响 (通过注入样式实现, 不改 css 文件) */
+function injectMobileCompactStyle() {
+  if (document.getElementById("ddhMobileCompact")) return;
+
+  const style = document.createElement("style");
+  style.id = "ddhMobileCompact";
+  style.textContent = [
+    "@media (max-width: 560px) {",
+    "  .header { padding-bottom: 6px !important; }",
+    "  .title { font-size: 16px !important; }",
+    "  .subtitle { display: none !important; }",
+    "  .icon-btn { width: 40px !important; height: 40px !important; }",
+
+    "  #collapseRow { padding: 4px 8px !important; }",
+    "  #collapseRow .mini-btn { min-height: 32px !important; font-size: 12px !important; padding: 0 10px !important; }",
+    "  #collapseRow .hint { display: none !important; }",
+
+    "  #modeSwitch { padding: 4px 8px !important; }",
+    "  #modeSwitch .mode-tab { min-height: 32px !important; font-size: 12.5px !important; }",
+
+    "  #bgToggleRow { padding: 3px 8px !important; }",
+    "  #bgToggleRow .mini-btn { min-height: 30px !important; font-size: 11.5px !important; padding: 0 8px !important; }",
+    "  #bgToggleRow .hint { display: none !important; }",
+
+    "  #bgPanel { padding: 6px 8px !important; }",
+    "  #bgPanel .field-label { font-size: 10px !important; }",
+    "  #bgPanel .field-input { min-height: 36px !important; padding: 6px 10px !important; }",
+    "  #bgPanel .field-textarea { min-height: 52px !important; }",
+    "  #bgPanel .mini-btn { min-height: 34px !important; font-size: 12px !important; }",
+    "  #bgPanel .vent-field { margin-bottom: 4px !important; }",
+
+    "  #ventMeterBox { padding: 0 8px 4px !important; }",
+    "  #ventMeterBox .vent-progress-head { margin-bottom: 2px !important; font-size: 10px !important; }",
+
+    "  .control-panel { padding: 4px 8px !important; gap: 4px !important; }",
+    "  .stats-card { padding: 2px 6px !important; }",
+    "  .stat { gap: 0 !important; }",
+    "  .stat-value { font-size: 15px !important; }",
+    "  .stat-value-sm { font-size: 11.5px !important; }",
+    "  .stat-label { font-size: 9px !important; }",
+    "  .stat-divider { height: 18px !important; }",
+
+    "  .strength-card { padding: 2px 8px 0 !important; }",
+    "  .strength-title { font-size: 11.5px !important; }",
+    "  .strength-tip { display: none !important; }",
+    "  .strength-slider { height: 28px !important; background-size: 100% 6px !important; }",
+    "  .strength-slider::-webkit-slider-runnable-track { height: 28px !important; }",
+    "  .strength-slider::-webkit-slider-thumb { width: 22px !important; height: 22px !important; margin-top: 3px !important; border-width: 2px !important; }",
+    "  .strength-labels { font-size: 9.5px !important; margin-top: -8px !important; }",
+
+    "  .tool-strip { padding: 3px 8px !important; gap: 4px !important; }",
+    "  .tool-chip { min-height: 32px !important; font-size: 11.5px !important; padding: 0 9px !important; }",
+    "  .scoreboard { padding: 3px 8px !important; }",
+
+    "  .chat-area { padding: 8px 8px 2px !important; }",
+    "  .message { margin-bottom: 12px !important; }",
+    "  .input-area { padding: 6px 8px calc(6px + env(safe-area-inset-bottom)) !important; }",
+    "  .input-box { min-height: 44px !important; padding: 10px 10px !important; }",
+    "  .btn { height: 44px !important; }",
+    "  .button-row { margin-top: 6px !important; }",
+    "}",
+  ].join("\n");
+
+  document.head.appendChild(style);
+}
+
+/** 注入顶部所有控件: 折叠行 / 模式切换 / 背景行 / 背景面板 / 进度条 */
+function mountTopUi() {
+  injectMobileCompactStyle();
+
   if (document.getElementById("modeSwitch")) {
     restoreBgInputs();
     guardBgToggle();
+    applyUiState();
     return;
   }
 
   const host = document.querySelector(".header");
   const toolbar = document.getElementById("toolStrip");
 
-  /* 1. 模式切换条 */
+  /* 1. 全局折叠行 (Bug16) */
+  const collapseRow = document.createElement("div");
+  collapseRow.id = "collapseRow";
+  collapseRow.style.padding = "6px 12px";
+  collapseRow.style.background = "var(--color-surface)";
+  collapseRow.style.borderBottom = "1px solid var(--color-border)";
+  collapseRow.style.display = "flex";
+  collapseRow.style.alignItems = "center";
+  collapseRow.style.gap = "8px";
+  collapseRow.innerHTML =
+    '<button id="collapseBtn" class="mini-btn" type="button" aria-expanded="true" aria-controls="modeSwitch">' +
+    "收起全部设置面板</button>" +
+    '<span class="hint" style="margin:0">只影响顶部控件, 聊天区不受影响</span>';
+
+  /* 2. 模式切换条 */
   const switcher = document.createElement("div");
   switcher.className = "mode-tabs";
   switcher.id = "modeSwitch";
@@ -1443,7 +1573,7 @@ function mountVentFeatures() {
     '<button class="mode-tab" type="button" data-mode="debate">反驳助手</button>' +
     '<button class="mode-tab" type="button" data-mode="vent">受骂模式</button>';
 
-  /* 2. 背景展开按钮: 永不禁用 (Bug6 / Bug10) */
+  /* 3. 背景展开按钮: 永不禁用 (Bug6 / Bug10) */
   const toggleRow = document.createElement("div");
   toggleRow.id = "bgToggleRow";
   toggleRow.style.padding = "6px 12px";
@@ -1457,7 +1587,7 @@ function mountVentFeatures() {
     "展开：宣泄对象背景设置</button>" +
     '<span class="hint" style="margin:0" id="bgHint">两种模式都能编辑, 只有受骂模式会用到</span>';
 
-  /* 3. 背景编辑面板 */
+  /* 4. 背景编辑面板 */
   const panel = document.createElement("div");
   panel.id = "bgPanel";
   panel.hidden = true;
@@ -1478,7 +1608,7 @@ function mountVentFeatures() {
     '  <button id="bgClearBtn" class="mini-btn" type="button">清空</button>' +
     '</div>';
 
-  /* 4. 受骂模式进度条 (只在受骂模式显示) */
+  /* 5. 受骂模式进度条 (只在受骂模式显示) */
   const meterBox = document.createElement("div");
   meterBox.id = "ventMeterBox";
   meterBox.hidden = true;
@@ -1488,7 +1618,7 @@ function mountVentFeatures() {
     '<div class="vent-progress-head"><span>承受进度</span><span id="ventMeterLabel">第 0 / 10 轮</span></div>' +
     '<div class="vent-bar-wrap" id="ventMeterWrap" data-stage="listen"><div class="vent-bar" id="ventMeterBar"></div></div>';
 
-  const nodes = [switcher, toggleRow, panel, meterBox];
+  const nodes = [collapseRow, switcher, toggleRow, panel, meterBox];
   nodes.forEach(function (n) { n.style.flex = "0 0 auto"; });
 
   if (host && host.parentNode) {
@@ -1504,6 +1634,14 @@ function mountVentFeatures() {
   }
 
   /* ---------- 事件 ---------- */
+
+  const collapseBtn = document.getElementById("collapseBtn");
+  if (collapseBtn) {
+    collapseBtn.disabled = false;
+    collapseBtn.addEventListener("click", function () {
+      togglePanelCollapse();
+    });
+  }
 
   switcher.addEventListener("click", function (e) {
     const btn = e.target && e.target.closest ? e.target.closest("[data-mode]") : null;
@@ -1528,7 +1666,6 @@ function mountVentFeatures() {
       const bioEl = document.getElementById("bgBio");
       const ok = saveCharacterBg(targetEl ? targetEl.value : "", bioEl ? bioEl.value : "");
       showToast(ok ? "背景设定已保存" : "保存失败, 可能是存储空间不足", 1600);
-      /* 保存后按钮依旧可点 */
       forceBgToggleEnabled();
     });
   }
@@ -1547,6 +1684,7 @@ function mountVentFeatures() {
   }
 
   restoreBgInputs();
+  applyUiState();
 }
 
 /** 把已保存的背景文本回填到输入框, 并挂上自动保存 */
@@ -1576,15 +1714,13 @@ function restoreBgInputs() {
   }
 }
 
-/** 展开 / 收起背景面板: 任何模式都允许 (Bug6 / Bug10) */
+/** 展开 / 收起背景面板: 与全局折叠互相独立 (Bug6 / Bug10 / Bug16) */
 function toggleBgPanel(open) {
-  const panel = document.getElementById("bgPanel");
+  bgPanelOpen = typeof open === "boolean" ? open : !bgPanelOpen;
+
   const btn = document.getElementById("bgToggleBtn");
   const hint = document.getElementById("bgHint");
 
-  bgPanelOpen = typeof open === "boolean" ? open : !bgPanelOpen;
-
-  if (panel) panel.hidden = !bgPanelOpen;
   if (btn) {
     btn.disabled = false;
     btn.setAttribute("aria-expanded", bgPanelOpen ? "true" : "false");
@@ -1595,7 +1731,9 @@ function toggleBgPanel(open) {
       ? (isVentMode() ? "当前是受骂模式, 保存后会进入对话" : "当前是反驳助手, 背景只在受骂模式生效")
       : "两种模式都能编辑, 只有受骂模式会用到";
   }
-  if (bgPanelOpen) restoreBgInputs();
+
+  applyUiState();
+  if (bgPanelOpen && !panelCollapsed) restoreBgInputs();
 }
 
 /** 受骂进度显示: 只属于受骂模式 */
@@ -1603,10 +1741,6 @@ function renderVentMeter() {
   const bar = document.getElementById("ventMeterBar");
   const label = document.getElementById("ventMeterLabel");
   const wrap = document.getElementById("ventMeterWrap");
-  const box = document.getElementById("ventMeterBox");
-
-  if (box) box.hidden = !isVentMode();
-  if (!bar && !label) return;
 
   const rounds = Math.min(ventState.rounds, VENT_PARAMS.minRounds);
   const pct = Math.round(rounds / VENT_PARAMS.minRounds * 100);
@@ -1621,9 +1755,12 @@ function renderVentMeter() {
   if (wrap) {
     wrap.setAttribute("data-stage", ventState.gameOver ? "end" : rounds >= 7 ? "shake" : "listen");
   }
+
+  /* 显隐统一交给 applyUiState, 避免和全局折叠打架 */
+  applyUiState();
 }
 
-/* ==================== 二十四. 模式切换 (Bug2 / Bug7 / Bug9 / Bug10) ==================== */
+/* ==================== 二十四. 模式切换 (Bug2 / Bug7 / Bug9 / Bug10 / Bug15) ==================== */
 
 function setMode(next, options) {
   const opts = options || {};
@@ -1650,7 +1787,6 @@ function setMode(next, options) {
   }
   if (sendButton) sendButton.disabled = false;
 
-  /* Bug6 / Bug10: 背景按钮永远可点 */
   forceBgToggleEnabled();
 
   const hint = document.getElementById("bgHint");
@@ -1675,6 +1811,9 @@ function setMode(next, options) {
   if (mode === "debate") initStrength();
 
   refreshAiAvatars();
+
+  /* Bug15: 受骂模式隐藏辩论 UI; Bug16: 折叠状态保持一致 */
+  applyUiState();
   renderVentMeter();
 
   if (!opts.silent && prev !== mode) {
@@ -1760,6 +1899,7 @@ async function handleClear() {
 
   isClearing = false;
   forceBgToggleEnabled();
+  applyUiState();
   showToast("对话已清空, 可以重新开始一场", 1500);
   if (!IS_TOUCH) userInput.focus();
 }
@@ -2132,10 +2272,9 @@ function openDebateSummary() {
 }
 
 function toggleScoreboard() {
-  const board = document.getElementById("scoreboard");
-  if (!board) return;
-  board.hidden = !board.hidden;
+  scoreboardOpen = !scoreboardOpen;
   renderScoreValues();
+  applyUiState();
 }
 
 function renderScoreValues() {
@@ -2261,6 +2400,7 @@ function renderFallbackSettings(force) {
 
   const key = getApiKey();
   const mode = getMode();
+  const collapsed = panelCollapsed;
 
   body.innerHTML =
     '<section class="group">' +
@@ -2278,6 +2418,12 @@ function renderFallbackSettings(force) {
     '    <button class="mode-tab' + (mode === "vent" ? " active" : "") + '" type="button" data-fb-mode="vent">受骂模式</button>' +
     '  </div>' +
     '  <p class="hint">两套对话分开存储: debate_chat 与 vent_chat.</p>' +
+    '</section>' +
+    '<section class="group">' +
+    '  <h3 class="group-title">🧩 顶部面板</h3>' +
+    '  <button id="fbCollapse" class="mini-btn block" type="button">' +
+    (collapsed ? "展开全部设置面板" : "收起全部设置面板") +
+    '</button>' +
     '</section>' +
     '<section class="group">' +
     '  <h3 class="group-title">🖼️ 对方头像</h3>' +
@@ -2302,6 +2448,14 @@ function renderFallbackSettings(force) {
       if (!input) return;
       setSetting("apiKey", String(input.value || "").trim());
       showToast("密钥已保存在本机", 1600);
+    });
+  }
+
+  const collapseBtn = document.getElementById("fbCollapse");
+  if (collapseBtn) {
+    collapseBtn.addEventListener("click", function () {
+      togglePanelCollapse();
+      renderFallbackSettings(true);
     });
   }
 
@@ -2475,7 +2629,7 @@ function installGearFallback() {
   });
 }
 
-/** 接管 engine 的模式切换, 保证一定走 setMode (Bug2) */
+/** 接管 engine 的模式切换, 保证一定走 setMode (Bug2 / Bug15) */
 function patchEngineModeSwitch() {
   if (!window.DDHEngine) return;
   window.DDHEngine.applyMode = function (next) {
@@ -2486,7 +2640,7 @@ function patchEngineModeSwitch() {
 /* ==================== 三十五. 对外桥接接口 ==================== */
 
 window.DDH = {
-  version: "3.4.0",
+  version: "3.5.0",
   config: {
     API_URL: API_URL,
     MODEL_NAME: MODEL_NAME,
@@ -2549,6 +2703,9 @@ window.DDH = {
   openAppModal: openAppModal,
   closeAppModal: closeAppModal,
   toggleBgPanel: toggleBgPanel,
+  togglePanelCollapse: togglePanelCollapse,
+  applyUiState: applyUiState,
+  isPanelCollapsed: function () { return panelCollapsed; },
   forceBgToggleEnabled: forceBgToggleEnabled,
   canEndVentSession: canEndVentSession,
   ventPhaseOf: ventPhaseOf,
@@ -2607,6 +2764,9 @@ window.addEventListener("resize", function () { scrollToBottom(); });
 /* ==================== 三十七. 启动编排 ==================== */
 
 function boot() {
+  /* Bug16: 先读折叠状态, 避免首屏闪烁 */
+  safeRun("折叠状态读取", function () { panelCollapsed = loadPanelCollapsed(); });
+
   safeRun("主题", initTheme);
   safeRun("字号", applyStoredFontSize);
   safeRun("视口适配", initViewport);
@@ -2626,7 +2786,7 @@ function boot() {
     if (isDebateMode()) initStrength();
   });
 
-  safeRun("模式与背景面板挂载", mountVentFeatures);
+  safeRun("顶部 UI 挂载", mountTopUi);
 
   safeRun("DDHPanel 垫片", installPanelShim);
   safeRun("引擎模式切换接管", patchEngineModeSwitch);
@@ -2646,7 +2806,7 @@ function boot() {
     setMode(getMode(), { silent: true });
   });
 
-  /* 刷新后按 vent_state 恢复锁局, 保证 UI 与数据一致 */
+  /* 刷新后按 vent_state 恢复锁局 */
   safeRun("恢复受骂锁局状态", function () {
     if (isVentMode() && ventState.gameOver && ventState.rounds >= VENT_PARAMS.minRounds) {
       lockVentSession();
@@ -2663,8 +2823,12 @@ function boot() {
     forceBgToggleEnabled();
   });
 
+  /* Bug14 / Bug15 / Bug16: 统一刷新一次顶部显隐 */
+  safeRun("顶部显隐刷新", applyUiState);
+
   console.log("[DDH] 启动完成",
     "mode=" + getMode(),
+    "collapsed=" + panelCollapsed,
     "DDHStore=" + !!window.DDHStore,
     "DDHEngine=" + !!window.DDHEngine,
     "DDHPanel=" + (window.DDHPanel ? (DDHPanel.__shim ? "shim" : "real") : "none"));
