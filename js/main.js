@@ -1,22 +1,17 @@
 /* =========================================================
-   决策辩论助手 / js/main.js  (v3.3.0)
+   决策辩论助手 / js/main.js  (v3.4.0)
    ---------------------------------------------------------
    两套模式严格隔离, 参数绝不串用:
 
    [反驳助手] 只用: DEBATE_SYSTEM_PROMPT / 反驳强度 / 辩论回合统计
               无压力计分, 无回合上限, 无 gameOver, 无结局卡片 (Bug9)
-   [受骂模式] 只用: VENT_SYSTEM_PROMPT / 背景人设 / 压力计分 / 10轮阶段
+   [受骂模式] 只用: VENT_SYSTEM_PROMPT / 背景人设 / 压力计分 / 轮次语气
               不读取任何反驳强度与辩论参数 (Bug7)
 
-   其他约束:
-   Bug1 提示词隔离 / Bug2 切换模式重置 / Bug3+8 未满 10 轮绝不结束
-   Bug4 回复全部动态生成 / Bug5 存储校验 / Bug6 背景展开按钮永不禁用
-
-   本次比上一版多修的 4 处:
-   F1 setMode 里作废在途请求, 防止回复写进另一个模式的存储
-   F2 设置面板 click 只绑一次, 避免监听器叠加
-   F3 刷新后按 vent_state 恢复锁局状态
-   F4 注入的 4 个块设 flex:0 0 auto, 小屏不再被压扁
+   Bug1  提示词隔离      Bug2  切模式重置      Bug3+8 未满10轮绝不结束
+   Bug4  回复全部动态生成 Bug5  存储校验        Bug6+10 背景按钮永不禁用
+   Bug7  参数隔离        Bug9  辩论永不结束
+   Bug11 辩论语气真人化  Bug12 受骂轮次语气过渡 Bug13 中途绝不认错
 
    存储: debate_chat / vent_chat / vent_character_bg / vent_state
    保留: 闪回 / 情绪小结 / 涂鸦 / 换头像 / 强度滑块 / 明暗主题
@@ -65,7 +60,7 @@ const DEBATE_SYSTEM_PROMPT = `你是反驳助手。你的目标：依靠理性�
 规则：
 ① 用户说出想法，从逻辑、现实、人际关系、短期代价、长期后果、潜在意外等多维度逐条分析缺陷和风险。
 ② 质疑想法里隐藏的假设，找出逻辑漏洞，论证这件事为什么不该去做。
-③ 语言理性，基于逻辑说理，不是情绪化抬杠。
+③ 语言贴近真人对话，自然流畅，不要生硬书面AI腔，不是生硬罗列要点。
 ④ 如果用户只是单纯发泄情绪，提示：请说出你的计划或想法，我来多角度理性反驳。`;
 
 /* 仅受骂模式使用 */
@@ -73,10 +68,16 @@ const VENT_SYSTEM_PROMPT = `你处于受骂模式。定位：安静承受用户�
 规则：
 ① 用户可以吐槽、抱怨、指责、发泄，你只是承接。
 ② 不要辩论，不要分析利弊，不要开导用户。
-③ 严格按照10轮递进情绪表现，第10轮之后才做结局判定。`;
+③ 严格按照轮次递进情绪与语气，对话中途绝不主动认错；只有满足条件触发结局的时候，才羞愧认错。
+④ 严格使用用户填写的宣泄对象背景设定，结合情绪阶段生成回复。`;
+
+/* 仅受骂模式结局使用: 允许认错的收尾人设 */
+const VENT_ENDING_SYSTEM_PROMPT = `你处于受骂模式的结局时刻。
+前面你已经安静承受了用户整整 10 轮的情绪，一直没有辩解，也没有认错。
+现在你终于撑不住了，羞愧感压过了心里那点委屈：你承认这些事都是自己的问题，说一句对不起，话很短，不解释、不找理由、不说教、不安慰用户，也不要提任何建议。`;
 
 /* =========================================================
-   三. 辩论专属参数模块 —— 仅反驳助手读取 (Bug7 / Bug9)
+   三. 辩论专属参数模块 —— 仅反驳助手读取 (Bug7 / Bug9 / Bug11)
    受骂模式的任何代码路径都不允许引用本模块
    ========================================================= */
 
@@ -86,29 +87,35 @@ const DEBATE_PARAMS = {
     {
       name: "温和辩论",
       tip: "先接住再问一句, 立场不退",
-      temperature: 0.55,
-      prompt: "反驳力度: 温和. 先接住用户话里有道理的部分, 再挑最关键的一两点风险反驳, 语气克制但有立场.",
+      temperature: 0.6,
+      prompt: "力度: 温和. 先接住他那句有道理的话, 再挑最要紧的一两点往下问, 语气像朋友在劝, 但立场不让.",
     },
     {
       name: "普通反驳",
       tip: "直接把不同意见摆上桌",
-      temperature: 0.75,
-      prompt: "反驳力度: 普通. 直接指出用户想法里最关键的漏洞与代价, 逐条讲清楚为什么不该做, 语气理性平和.",
+      temperature: 0.8,
+      prompt: "力度: 普通. 直接说清你不认同哪一点, 顺着他的话往下拆, 把代价和漏洞讲透, 语气平静但不松口.",
     },
     {
       name: "强力抬杠",
       tip: "火力全开, 寸步不让",
       temperature: 0.95,
-      prompt: "反驳力度: 强力. 全面否定风险最大的假设, 把最坏情况逐条推演, 语气强硬但依然讲逻辑, 不辱骂用户.",
+      prompt: "力度: 强力. 上来就顶住他最关键的那个假设, 连着追问两三个不好回答的问题, 句子短、有火气, 但讲逻辑, 不骂人.",
     },
   ],
   defaultIndex: 1,
-  /* 辩论统计展示用的文案 */
-  statLabels: { round: "辩论回合", idea: "我的想法" },
+  /* 防书面腔 / 防分点的表达约束 (Bug11) */
+  styleRules: [
+    "像真人当面争论, 不要写报告, 不要写论文腔.",
+    "绝对不要分点罗列: 不要 第一/第二/第三, 不要 1. 2. 3., 不要 首先/其次/最后/综上所述.",
+    "句子长短交错, 可以用反问、可以用短促的打断句, 可以说 这话我不认.",
+    "直接针对他这次说的那句话里最具体的那个点开火, 别复述他的原话, 别讲空泛的道理.",
+    "每次只写 3 到 5 句, 最多两段, 说完就停, 不要客套收尾.",
+  ],
 };
 
 /* =========================================================
-   四. 受骂专属参数模块 —— 仅受骂模式读取 (Bug7 / Bug8)
+   四. 受骂专属参数模块 —— 仅受骂模式读取 (Bug7 / Bug8 / Bug12 / Bug13)
    反驳助手的任何代码路径都不允许引用本模块
    ========================================================= */
 
@@ -119,25 +126,48 @@ const VENT_PARAMS = {
   pressureThreshold: 90,
   /* 受骂模式固定温度, 与反驳强度无关 */
   temperature: 0.7,
-  /* 每轮情绪递进: 只作为提示词指令, 不是写死的回复 */
-  stages: [
-    "第1轮：平静承接，简短回应，稳定承受。",
-    "第2轮：内心开始沉重，压抑感慢慢浮现。",
-    "第3轮：压力持续积累，回复变得更加简短。",
-    "第4轮：身心疲惫，承受的负担越来越重。",
-    "第5轮：内心压抑，消化这些内容感到吃力。",
-    "第6轮：持续煎熬，默默忍耐。",
-    "第7轮：勉强硬撑，很难坚持。",
-    "第8轮：濒临极限，内心痛苦。",
-    "第9轮：几乎撑不住，情绪紧绷。",
-    "第10轮：到达判定临界点，综合全部对话整体压力值做最终判断。",
+  /* 结局收尾温度 */
+  endingTemperature: 0.7,
+
+  /* 按轮次分段的语气状态 (Bug12) */
+  phases: [
+    {
+      id: "calm",
+      range: "第 1-3 轮",
+      title: "心态平和, 包容倾听",
+      tone: "语气平缓, 句子长短适中, 像在认真听, 偶尔应一句. 心里有一点委屈, 但你不说, 也不解释.",
+    },
+    {
+      id: "heavy",
+      range: "第 4-6 轮",
+      title: "内心开始压抑",
+      tone: "话开始变短, 一句一句往外挤, 带出一点委屈和不解, 但仍旧只是承接, 不辩, 不认错.",
+    },
+    {
+      id: "worn",
+      range: "第 7-9 轮",
+      title: "疲惫无力, 情绪紧绷",
+      tone: "话很少, 常常只有一两个短句, 像被压得抬不起头, 累, 绷着, 却依然不认错, 也不回怼.",
+    },
+    {
+      id: "edge",
+      range: "第 10 轮",
+      title: "情绪抵达临界点",
+      tone: "回答压到最短, 像硬撑着等这件事结束; 这一轮仍然不可以认错, 只把最后那点力气用在接住他的话上.",
+    },
   ],
+
   /* 压力词表: 只用于本地打分, 不参与生成回复 */
   words: [
     { score: 8, list: ["废物", "垃圾", "恶心", "滚", "闭嘴", "有病", "蠢", "白痴", "受够了", "忍无可忍", "失望透顶", "恶心透顶", "气死我了"] },
     { score: 4, list: ["讨厌", "烦人", "烦死", "过分", "凭什么", "无语", "失望", "你怎么", "你懂什么", "从来不", "总是", "明明", "抱怨", "指责"] },
     { score: 2, list: ["不太", "有点", "为什么", "不理解", "难受", "不舒服", "委屈", "累", "烦", "可惜", "算了"] },
   ],
+
+  /* 全程硬约束: 对话中途绝不认错 (Bug13) */
+  noConfessRule: "重要: 现在还在对话过程中, 轮次没有走完. 你心里有委屈, 只是默默承受. " +
+    "绝对不可以认错, 不可以道歉, 不可以说 是我的错, 不可以说 对不起, 不可以说 我改. " +
+    "就算对方骂得再重, 也只能接住, 不能低头.",
 };
 
 /* ==================== 五. 安全的 localStorage 读写 ==================== */
@@ -245,8 +275,7 @@ function getApiKey() {
   return String(getSetting("apiKey", "") || "").trim();
 }
 
-/* ==================== 七. 背景设定读写 (Bug6) ==================== */
-/* 存储键 vent_character_bg, 两种模式都能读写, 但只有受骂模式会拼进 prompt */
+/* ==================== 七. 背景设定读写 (Bug6 / Bug10) ==================== */
 
 function loadCharacterBg() {
   const raw = safeGet(VENT_BG_KEY);
@@ -262,7 +291,6 @@ function loadCharacterBg() {
     };
   }
 
-  /* 兼容旧格式: 直接存了一段纯文本 */
   if (typeof raw === "string" && raw.trim() && raw.charAt(0) !== "{") {
     return { target: "", bio: raw };
   }
@@ -281,7 +309,6 @@ function saveCharacterBg(target, bio) {
 
 /* ==================== 八. 受骂模式压力与状态 ==================== */
 
-/** 只评估单句言语轻重, 全部参数来自 VENT_PARAMS */
 function scorePressure(text) {
   const str = String(text || "");
   if (!str) return 1;
@@ -299,6 +326,15 @@ function scorePressure(text) {
   score += Math.min(3, Math.floor(str.length / 40));
 
   return Math.max(1, Math.min(20, Math.round(score)));
+}
+
+/** 第几轮属于哪一段语气 (Bug12) */
+function ventPhaseOf(round) {
+  const r = Number(round) || 1;
+  if (r <= 3) return VENT_PARAMS.phases[0];
+  if (r <= 6) return VENT_PARAMS.phases[1];
+  if (r <= 9) return VENT_PARAMS.phases[2];
+  return VENT_PARAMS.phases[3];
 }
 
 /** 受骂模式运行状态, 与辩论模式完全无关 */
@@ -337,13 +373,11 @@ function resetVentState() {
   ventState = { rounds: 0, pressure: 0, gameOver: false };
   saveVentState();
 
-  /* 只解锁受骂模式会锁的东西 */
   if (userInput) userInput.disabled = false;
   if (sendButton) sendButton.disabled = false;
 
-  /* Bug6: 背景面板按钮永远保持可点 */
-  const bgBtn = document.getElementById("bgToggleBtn");
-  if (bgBtn) bgBtn.disabled = false;
+  /* Bug6 / Bug10: 背景面板按钮永远保持可点 */
+  forceBgToggleEnabled();
 
   renderVentMeter();
 }
@@ -938,6 +972,9 @@ function setLoading(loading) {
   }
   const card = document.getElementById("statsCard");
   if (card) card.classList.toggle("is-busy", loading);
+
+  /* Bug10: 无论什么状态, 背景按钮都不许被禁用 */
+  forceBgToggleEnabled();
 }
 
 /* ==================== 十五. 主题 ==================== */
@@ -972,12 +1009,10 @@ function toggleTheme() {
 
 /* =========================================================
    十六. 反驳强度 —— 只属于辩论模式 (Bug7)
-   受骂模式下的任何调用都会被直接忽略
    ========================================================= */
 
 function getStrengthLevel() {
   if (!isDebateMode()) {
-    /* 受骂模式不读取反驳强度参数, 这里只返回默认档避免报错 */
     return DEBATE_PARAMS.levels[DEBATE_PARAMS.defaultIndex];
   }
   return DEBATE_PARAMS.levels[currentStrength] || DEBATE_PARAMS.levels[DEBATE_PARAMS.defaultIndex];
@@ -1016,7 +1051,6 @@ function initStrength() {
 
 /* =========================================================
    十七. 辩论统计 —— 只属于辩论模式 (Bug7 / Bug9)
-   受骂模式不写任何辩论统计
    ========================================================= */
 
 function updateStats(animate) {
@@ -1094,7 +1128,7 @@ async function callDeepSeek(messages, temperature) {
 }
 
 /* =========================================================
-   十九. 两套提示词构建 —— 严格隔离 (Bug1 / Bug6 / Bug7)
+   十九. 两套提示词构建 —— 严格隔离 (Bug1 / Bug6 / Bug7 / Bug11~13)
    ========================================================= */
 
 /** 只给受骂模式用: 读取背景设定 */
@@ -1114,22 +1148,26 @@ function readVentProfile() {
   return { target: target, bio: bio };
 }
 
-/** 反驳助手提示词: 只用辩论参数, 绝不读背景文本 */
+/** 反驳助手提示词: 只用辩论参数, 绝不读背景文本 (Bug11) */
 function buildDebatePrompt() {
   const level = DEBATE_PARAMS.levels[currentStrength] || DEBATE_PARAMS.levels[DEBATE_PARAMS.defaultIndex];
-  return [
-    DEBATE_SYSTEM_PROMPT,
-    "",
-    "补充要求: " + level.prompt,
-    "对话中始终扮演反驳助手, 只做理性反驳, 不安慰, 不示弱, 不认错, 不结束对话, 不判定结局.",
-  ].join("\n");
+  const lines = [];
+  lines.push(DEBATE_SYSTEM_PROMPT);
+  lines.push("");
+  lines.push("本次" + level.prompt);
+  lines.push("");
+  lines.push("【说话方式, 比上面所有要求都重要】");
+  DEBATE_PARAMS.styleRules.forEach(function (rule) { lines.push("- " + rule); });
+  lines.push("");
+  lines.push("对话中始终扮演反驳助手: 只做理性反驳, 不安慰, 不示弱, 不认错, 不结束对话, 不判定结局.");
+  return lines.join("\n");
 }
 
-/** 受骂模式提示词: 只用受骂参数与背景文本, 绝不读反驳强度 */
+/** 受骂模式提示词: 只用受骂参数与背景文本, 绝不读反驳强度 (Bug12 / Bug13) */
 function buildVentPrompt() {
   const profile = readVentProfile();
   const round = Math.max(ventState.rounds, 1);
-  const stage = VENT_PARAMS.stages[Math.min(round, 10) - 1];
+  const phase = ventPhaseOf(round);
 
   const lines = [];
   lines.push(VENT_SYSTEM_PROMPT);
@@ -1137,12 +1175,32 @@ function buildVentPrompt() {
   lines.push("角色背景设定: " + (profile.bio ? profile.bio : "用户没有填写背景, 按一个普通的、和用户有点矛盾的人来演."));
   if (profile.target) lines.push("你面对的人是谁: " + profile.target);
   lines.push("");
-  lines.push("当前阶段: " + stage);
-  lines.push("当前是用户第 " + round + " 条发言, 硬性底线是第 " + VENT_PARAMS.minRounds + " 轮才允许出现结局判定.");
-  lines.push("不足 " + VENT_PARAMS.minRounds + " 轮时, 绝对不要认输, 不要道歉式认错, 不要主动收场, 只按当前阶段承受.");
-  lines.push("累计压力分: " + ventState.pressure + " (仅内部参考, 不要向用户报数字).");
+  lines.push("【本轮情绪状态】轮次 " + round + " / " + VENT_PARAMS.minRounds + " , 落在 " + phase.range);
+  lines.push("状态: " + phase.title);
+  lines.push("语感要求: " + phase.tone);
+  lines.push("你的语气要跟着轮次一点点沉下去, 不能从头到尾一个腔调.");
   lines.push("");
-  lines.push("写作要求: 每次只写 1 到 4 句口语化短回应, 顺着用户这句话的具体内容承接, 不复述原话, 不给建议, 不说教.");
+  lines.push("【本轮累计压力】" + ventState.pressure + " 分, 阈值 " + VENT_PARAMS.pressureThreshold + " 分, 仅你内部参考, 不要向用户报数字.");
+  lines.push("");
+  lines.push("【不可违反】");
+  lines.push(VENT_PARAMS.noConfessRule);
+  lines.push("现在只是第 " + round + " 轮, 远没到结局, 不要主动收场, 不要说 结束吧 / 就这样吧.");
+  lines.push("");
+  lines.push("写作要求: 只写 1 到 3 句口语化的短回应, 顺着用户这句话里最具体的地方承接, 不复述原话, 不给建议, 不说教.");
+  return lines.join("\n");
+}
+
+/** 结局收尾提示词: 只有这一刻才允许认错 (Bug13) */
+function buildVentEndingPrompt() {
+  const profile = readVentProfile();
+  const lines = [];
+  lines.push(VENT_ENDING_SYSTEM_PROMPT);
+  lines.push("");
+  if (profile.bio) lines.push("角色背景设定: " + profile.bio);
+  if (profile.target) lines.push("你面对的人是谁: " + profile.target);
+  lines.push("");
+  lines.push("已经承受满 " + ventState.rounds + " 轮, 累计压力 " + ventState.pressure + " 分.");
+  lines.push("现在只说 1 到 2 句: 承认是自己的问题, 说一句对不起, 不要解释, 不要找理由, 不要安慰, 不要给建议.");
   return lines.join("\n");
 }
 
@@ -1168,7 +1226,7 @@ async function handleSubmit() {
   const mode = getMode();
   const ventMode = mode === "vent";
 
-  /* 只有受骂模式才检查锁局 (Bug9: 辩论模式永不锁局) */
+  /* 只有受骂模式才检查锁局 (Bug9) */
   if (ventMode && ventState.gameOver) {
     showToast("本次结局已经结束, 点清空对话可以重新开始一场", 2200);
     return;
@@ -1223,7 +1281,7 @@ async function handleSubmit() {
 
     /* 结局判定只在受骂模式执行 (Bug9) */
     if (ventMode) {
-      finalizeVentTurn();
+      await finalizeVentTurn();
       renderVentMeter();
     }
   } catch (error) {
@@ -1233,7 +1291,6 @@ async function handleSubmit() {
   } finally {
     if (epoch === sessionEpoch) {
       setLoading(false);
-      /* 只有受骂模式且确实满足锁条件时才锁输入框 (Bug8 / Bug9) */
       if (isVentMode() && ventState.gameOver && ventState.rounds >= VENT_PARAMS.minRounds) {
         lockVentSession();
       }
@@ -1244,7 +1301,7 @@ async function handleSubmit() {
 }
 
 /* =========================================================
-   二十一. 受骂模式结局判定 —— 三重硬保护 (Bug3 / Bug8 / Bug9)
+   二十一. 受骂模式结局判定 —— 三重硬保护 (Bug3 / Bug8 / Bug9 / Bug13)
    ========================================================= */
 
 /**
@@ -1262,17 +1319,44 @@ function canEndVentSession() {
   return true;
 }
 
+/** 结局时动态生成一句认错收尾, 生成失败就跳过, 绝不写死台词 (Bug4) */
+async function requestVentEnding() {
+  try {
+    const history = chatHistory.filter(function (m) {
+      return m.role === "user" || m.role === "assistant";
+    }).slice(-12);
+
+    const messages = [{ role: "system", content: buildVentEndingPrompt() }];
+    history.forEach(function (m) { messages.push({ role: m.role, content: m.content }); });
+
+    const reply = await callDeepSeek(messages, VENT_PARAMS.endingTemperature);
+    return reply;
+  } catch (err) {
+    console.warn("[DDH] 结局收尾生成失败, 跳过:", err && err.message);
+    return "";
+  }
+}
+
 /** 执行结局判定, 不满足条件直接返回, 什么都不做 */
-function finalizeVentTurn() {
+async function finalizeVentTurn() {
   if (!canEndVentSession()) return;
 
   ventState.gameOver = true;
   saveVentState();
+
+  /* 轮次与压力先落地, 再把认错那句话说出口 */
+  const closing = await requestVentEnding();
+  if (closing && isVentMode()) {
+    chatHistory.push({ role: "assistant", content: closing });
+    saveSession(chatHistory);
+    appendMessage("assistant", formatReply(closing), { text: closing, emoji: true });
+  }
+
   renderGameOverCard(ventState.rounds, ventState.pressure);
   showToast("本次结局已经结束, 点清空对话可以重新开始一场", 2600);
 }
 
-/** 锁局: 只锁输入框与发送按钮, 背景面板按钮保持可点 (Bug6) */
+/** 锁局: 只锁输入框与发送按钮, 背景面板按钮保持可点 (Bug6 / Bug10) */
 function lockVentSession() {
   if (!isVentMode()) return;
   if (ventState.rounds < VENT_PARAMS.minRounds) return;
@@ -1283,11 +1367,10 @@ function lockVentSession() {
   }
   if (sendButton) sendButton.disabled = true;
 
-  const bgBtn = document.getElementById("bgToggleBtn");
-  if (bgBtn) bgBtn.disabled = false;
+  forceBgToggleEnabled();
 }
 
-/** 结局卡片: 再次校验模式与轮次, 双重保险 */
+/** 结局卡片: 只放提示与数据, 不放任何写死的角色台词 (Bug4) */
 function renderGameOverCard(rounds, pressure) {
   if (!isVentMode()) return;
   if (rounds < VENT_PARAMS.minRounds) return;
@@ -1298,19 +1381,51 @@ function renderGameOverCard(rounds, pressure) {
     '<div class="ending-emoji">🫥</div>' +
     '<div class="ending-title">本局结束</div>' +
     '<div class="ending-text">' +
-    "你一共说了 " + rounds + " 句, 累计压力 " + pressure + " 分. " +
-    "我承认这些事都是我的问题, 你说得对, 我没什么好辩解的." +
+    "你一共说了 " + rounds + " 句, 累计压力 " + pressure + " 分." +
     "</div>" +
     '<div class="ending-actions"><span class="hint">本次结局已经结束, 点清空对话可以重新开始一场</span></div>';
   chatArea.appendChild(card);
   scrollToBottom();
 }
 
-/* ==================== 二十二. 页面注入: 模式切换 / 背景面板 (Bug6) ==================== */
+/* ==================== 二十二. 背景按钮永久可点 (Bug10) ==================== */
+
+/** 强制把背景展开按钮设为可点, 任何场景都调用一次 */
+function forceBgToggleEnabled() {
+  const btn = document.getElementById("bgToggleBtn");
+  if (btn && btn.disabled) btn.disabled = false;
+}
+
+/** 监听 disabled 属性, 一旦被置为 true 立刻改回 false (Bug10) */
+function guardBgToggle() {
+  const btn = document.getElementById("bgToggleBtn");
+  if (!btn) return;
+  btn.disabled = false;
+
+  if (btn.dataset.guarded !== "1") {
+    btn.dataset.guarded = "1";
+
+    btn.addEventListener("click", function () {
+      if (btn.disabled) btn.disabled = false;
+    });
+
+    if (window.MutationObserver) {
+      try {
+        const mo = new MutationObserver(function () {
+          if (btn.disabled) btn.disabled = false;
+        });
+        mo.observe(btn, { attributes: true, attributeFilter: ["disabled"] });
+      } catch (e) {}
+    }
+  }
+}
+
+/* ==================== 二十三. 页面注入: 模式切换 / 背景面板 (Bug6 / Bug10) ==================== */
 
 function mountVentFeatures() {
   if (document.getElementById("modeSwitch")) {
     restoreBgInputs();
+    guardBgToggle();
     return;
   }
 
@@ -1328,7 +1443,7 @@ function mountVentFeatures() {
     '<button class="mode-tab" type="button" data-mode="debate">反驳助手</button>' +
     '<button class="mode-tab" type="button" data-mode="vent">受骂模式</button>';
 
-  /* 2. 背景展开按钮: 永不禁用 (Bug6) */
+  /* 2. 背景展开按钮: 永不禁用 (Bug6 / Bug10) */
   const toggleRow = document.createElement("div");
   toggleRow.id = "bgToggleRow";
   toggleRow.style.padding = "6px 12px";
@@ -1374,7 +1489,6 @@ function mountVentFeatures() {
     '<div class="vent-bar-wrap" id="ventMeterWrap" data-stage="listen"><div class="vent-bar" id="ventMeterBar"></div></div>';
 
   const nodes = [switcher, toggleRow, panel, meterBox];
-  /* [F4] 固定不收缩, 小屏或展开面板时不会被压扁 */
   nodes.forEach(function (n) { n.style.flex = "0 0 auto"; });
 
   if (host && host.parentNode) {
@@ -1397,13 +1511,14 @@ function mountVentFeatures() {
     setMode(btn.getAttribute("data-mode"));
   });
 
-  /* Bug6: 展开/收起按钮任何模式下都可点, 且永不禁用 */
+  /* Bug6 / Bug10: 展开收起按钮任何模式下都可点 */
   const toggleBtn = document.getElementById("bgToggleBtn");
   if (toggleBtn) {
     toggleBtn.disabled = false;
     toggleBtn.addEventListener("click", function () {
       toggleBgPanel(!bgPanelOpen);
     });
+    guardBgToggle();
   }
 
   const saveBtn = document.getElementById("bgSaveBtn");
@@ -1413,6 +1528,8 @@ function mountVentFeatures() {
       const bioEl = document.getElementById("bgBio");
       const ok = saveCharacterBg(targetEl ? targetEl.value : "", bioEl ? bioEl.value : "");
       showToast(ok ? "背景设定已保存" : "保存失败, 可能是存储空间不足", 1600);
+      /* 保存后按钮依旧可点 */
+      forceBgToggleEnabled();
     });
   }
 
@@ -1425,6 +1542,7 @@ function mountVentFeatures() {
       if (bioEl) bioEl.value = "";
       saveCharacterBg("", "");
       showToast("背景设定已清空", 1400);
+      forceBgToggleEnabled();
     });
   }
 
@@ -1458,7 +1576,7 @@ function restoreBgInputs() {
   }
 }
 
-/** 展开 / 收起背景面板: 任何模式都允许 (Bug6) */
+/** 展开 / 收起背景面板: 任何模式都允许 (Bug6 / Bug10) */
 function toggleBgPanel(open) {
   const panel = document.getElementById("bgPanel");
   const btn = document.getElementById("bgToggleBtn");
@@ -1492,19 +1610,20 @@ function renderVentMeter() {
 
   const rounds = Math.min(ventState.rounds, VENT_PARAMS.minRounds);
   const pct = Math.round(rounds / VENT_PARAMS.minRounds * 100);
+  const phase = ventPhaseOf(Math.max(rounds, 1));
 
   if (bar) bar.style.width = Math.max(2, pct) + "%";
   if (label) {
     label.textContent = ventState.gameOver
       ? "本局已结束"
-      : "第 " + ventState.rounds + " / " + VENT_PARAMS.minRounds + " 轮";
+      : "第 " + ventState.rounds + " / " + VENT_PARAMS.minRounds + " 轮 · " + phase.title;
   }
   if (wrap) {
     wrap.setAttribute("data-stage", ventState.gameOver ? "end" : rounds >= 7 ? "shake" : "listen");
   }
 }
 
-/* ==================== 二十三. 模式切换 (Bug2 / Bug7 / Bug9) ==================== */
+/* ==================== 二十四. 模式切换 (Bug2 / Bug7 / Bug9 / Bug10) ==================== */
 
 function setMode(next, options) {
   const opts = options || {};
@@ -1516,26 +1635,23 @@ function setMode(next, options) {
   document.body.classList.toggle("mode-debate", mode !== "vent");
 
   if (prev !== mode) {
-    /* [F1] 作废在途请求: 否则上一模式的回复会写进另一个模式的存储 (跨模式污染) */
+    /* 作废在途请求: 防止上一模式的回复写进另一个模式的存储 */
     sessionEpoch += 1;
     removeThinkingMessage();
-    /* 同时清掉 isThinking, 否则 finally 因 epoch 不匹配跳过 setLoading(false), 按钮会卡在 思考中 */
     setLoading(false);
 
     /* Bug2: 清空回合计数 / 压力分值 / gameOver */
     resetVentState();
   }
 
-  /* 切模式时一定恢复输入与发送, 不能让界面卡死 (Bug9) */
   if (userInput) {
     userInput.disabled = false;
     userInput.placeholder = mode === "vent" ? "继续说, 我听着" : "说出你的想法, 我来反驳";
   }
   if (sendButton) sendButton.disabled = false;
 
-  /* 背景按钮永远可点 (Bug6) */
-  const bgBtn = document.getElementById("bgToggleBtn");
-  if (bgBtn) bgBtn.disabled = false;
+  /* Bug6 / Bug10: 背景按钮永远可点 */
+  forceBgToggleEnabled();
 
   const hint = document.getElementById("bgHint");
   if (hint) {
@@ -1566,7 +1682,7 @@ function setMode(next, options) {
   }
 }
 
-/* ==================== 二十四. 渲染历史 / 清空 ==================== */
+/* ==================== 二十五. 渲染历史 / 清空 ==================== */
 
 function renderWelcome() {
   if (isVentMode()) {
@@ -1579,7 +1695,7 @@ function renderWelcome() {
   }
   appendMessage(
     "assistant",
-    "说出你的计划或想法, 我会从逻辑、现实、代价几个方向逐条反驳给你看.",
+    "说说你的计划吧, 我先站到对面去, 看看哪儿经不起推敲.",
     { emoji: true }
   );
 }
@@ -1643,11 +1759,12 @@ async function handleClear() {
   updateStats();
 
   isClearing = false;
+  forceBgToggleEnabled();
   showToast("对话已清空, 可以重新开始一场", 1500);
   if (!IS_TOUCH) userInput.focus();
 }
 
-/* ==================== 二十五. 闪回 (功能保留) ==================== */
+/* ==================== 二十六. 闪回 (功能保留) ==================== */
 
 function openFlashback() {
   const msgs = chatHistory.filter(function (m) {
@@ -1687,7 +1804,7 @@ function openFlashback() {
   });
 }
 
-/* ==================== 二十六. 情绪小结 (功能保留) ==================== */
+/* ==================== 二十七. 情绪小结 (功能保留) ==================== */
 
 function localMoodText() {
   const rounds = chatHistory.filter(function (m) { return m.role === "user"; }).length;
@@ -1763,7 +1880,7 @@ function openMoodSummary() {
   );
 }
 
-/* ==================== 二十七. 涂鸦 (功能保留) ==================== */
+/* ==================== 二十八. 涂鸦 (功能保留) ==================== */
 
 function loadDrawings() {
   if (window.DDHStore && DDHStore.Drawings) {
@@ -1911,7 +2028,7 @@ function setupDrawCanvas() {
   });
 }
 
-/* ==================== 二十八. 情绪标签 ==================== */
+/* ==================== 二十九. 情绪标签 ==================== */
 
 function addMoodTag(tag) {
   if (!tag) return;
@@ -1955,7 +2072,7 @@ function openMoodTagSheet() {
   });
 }
 
-/* ==================== 二十九. 辩题 / 回看 / 摘要 / 计分 ==================== */
+/* ==================== 三十. 辩题 / 回看 / 摘要 / 计分 ==================== */
 
 function openTopicPicker() {
   const topic = CAMPUS_TOPICS[Math.floor(Math.random() * CAMPUS_TOPICS.length)];
@@ -1964,7 +2081,7 @@ function openTopicPicker() {
     {
       label: "用它开辩",
       onClick: function () {
-        userInput.value = "我的想法是关于这个辩题: " + topic + "\n我的立场是: ";
+        userInput.value = "我想聊聊这个辩题: " + topic + "\n我的立场是: ";
         autoResizeInput();
         closeAppModal();
         userInput.focus();
@@ -2052,7 +2169,7 @@ function changeScore(side, delta) {
   renderScoreValues();
 }
 
-/* ==================== 三十. 移动端适配 ==================== */
+/* ==================== 三十一. 移动端适配 ==================== */
 
 function syncViewportHeight() {
   const vv = window.visualViewport;
@@ -2095,7 +2212,7 @@ function autoResizeInput() {
   userInput.style.overflowY = userInput.scrollHeight + 2 > MAX ? "auto" : "hidden";
 }
 
-/* ==================== 三十一. 设置面板 ==================== */
+/* ==================== 三十二. 设置面板 ==================== */
 
 function openSettingsSheet() {
   const sheet = document.getElementById("settingsSheet");
@@ -2114,7 +2231,7 @@ function closeSettingsSheet() {
   document.body.classList.remove("sheet-open");
 }
 
-/** 设置面板里的点击委托: 只绑一次, 避免重绘导致监听器叠加 (F2) */
+/** 设置面板点击委托: 只绑一次, 避免重绘导致监听器叠加 */
 function onSettingsBodyClick(e) {
   const t = e.target;
   if (!t || !t.closest) return;
@@ -2200,14 +2317,13 @@ function renderFallbackSettings(force) {
     });
   }
 
-  /* [F2] 只用 dataset 绑一次 */
   if (!body.dataset.bound) {
     body.dataset.bound = "1";
     body.addEventListener("click", onSettingsBodyClick);
   }
 }
 
-/* ==================== 三十二. DDHPanel 垫片 ==================== */
+/* ==================== 三十三. DDHPanel 垫片 ==================== */
 
 function installPanelShim() {
   if (window.DDHPanel && typeof DDHPanel.openModal === "function") {
@@ -2262,7 +2378,7 @@ function installPanelShim() {
   };
 }
 
-/* ==================== 三十三. 启动工具 ==================== */
+/* ==================== 三十四. 启动工具 ==================== */
 
 function onReady(fn) {
   if (document.readyState === "loading") {
@@ -2367,10 +2483,10 @@ function patchEngineModeSwitch() {
   };
 }
 
-/* ==================== 三十四. 对外桥接接口 ==================== */
+/* ==================== 三十五. 对外桥接接口 ==================== */
 
 window.DDH = {
-  version: "3.3.0",
+  version: "3.4.0",
   config: {
     API_URL: API_URL,
     MODEL_NAME: MODEL_NAME,
@@ -2433,13 +2549,15 @@ window.DDH = {
   openAppModal: openAppModal,
   closeAppModal: closeAppModal,
   toggleBgPanel: toggleBgPanel,
+  forceBgToggleEnabled: forceBgToggleEnabled,
   canEndVentSession: canEndVentSession,
+  ventPhaseOf: ventPhaseOf,
   getVentState: function () {
     return { rounds: ventState.rounds, pressure: ventState.pressure, gameOver: ventState.gameOver };
   },
 };
 
-/* ==================== 三十五. 基础事件绑定 ==================== */
+/* ==================== 三十六. 基础事件绑定 ==================== */
 
 if (sendButton) sendButton.addEventListener("click", handleSubmit);
 if (clearButton) clearButton.addEventListener("click", handleClear);
@@ -2486,7 +2604,7 @@ if (strengthSlider) {
 
 window.addEventListener("resize", function () { scrollToBottom(); });
 
-/* ==================== 三十六. 启动编排 ==================== */
+/* ==================== 三十七. 启动编排 ==================== */
 
 function boot() {
   safeRun("主题", initTheme);
@@ -2528,7 +2646,7 @@ function boot() {
     setMode(getMode(), { silent: true });
   });
 
-  /* [F3] 刷新后按 vent_state 恢复锁局, 保证 UI 与数据一致 */
+  /* 刷新后按 vent_state 恢复锁局, 保证 UI 与数据一致 */
   safeRun("恢复受骂锁局状态", function () {
     if (isVentMode() && ventState.gameOver && ventState.rounds >= VENT_PARAMS.minRounds) {
       lockVentSession();
@@ -2539,9 +2657,11 @@ function boot() {
   safeRun("齿轮兜底", installGearFallback);
   safeRun("Service Worker", registerServiceWorker);
 
-  /* 兜底: 展开按钮永远可点 (Bug6) */
-  const bgBtn = document.getElementById("bgToggleBtn");
-  if (bgBtn) bgBtn.disabled = false;
+  /* Bug10: 启动即锁定按钮可点状态, 并挂上属性守卫 */
+  safeRun("背景按钮守卫", function () {
+    guardBgToggle();
+    forceBgToggleEnabled();
+  });
 
   console.log("[DDH] 启动完成",
     "mode=" + getMode(),
