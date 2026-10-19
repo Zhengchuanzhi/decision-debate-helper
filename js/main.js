@@ -1,3 +1,27 @@
+// 切换背景面板显示/隐藏
+function toggleVentPanel() {
+  const panel = document.getElementById("ventPanel");
+  if(panel.getAttribute('aria-hidden') === "true"){
+    panel.setAttribute('aria-hidden',"false");
+  }else{
+    panel.setAttribute('aria-hidden',"true");
+  }
+}
+
+// 加载本地保存的宣泄对象与背景
+const savedTarget = localStorage.getItem("ventTarget");
+const savedBio = localStorage.getItem("ventBio");
+if(savedTarget) document.getElementById("ventTarget").value = savedTarget;
+if(savedBio) document.getElementById("ventBio").value = savedBio;
+
+// 输入内容自动保存到本地
+document.getElementById("ventTarget").addEventListener("input",e=>{
+  localStorage.setItem("ventTarget",e.target.value);
+})
+document.getElementById("ventBio").addEventListener("input",e=>{
+  localStorage.setItem("ventBio",e.target.value);
+})
+
 /* =========================================================
    决策辩论助手 / js/main.js
    ---------------------------------------------------------
