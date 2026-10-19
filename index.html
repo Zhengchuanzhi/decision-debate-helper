@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 移动端适配: 宽度跟随设备, 禁止缩放, viewport-fit=cover 让安全区生效 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="theme-color" content="#f5f6f8" id="themeColorMeta" />
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="辩论助手" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <meta name="color-scheme" content="light dark" />
+
+  <!-- 首屏主题防闪 -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("harness_debate_theme");
+        var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.setAttribute("data-theme", saved || (prefersDark ? "dark" : "light"));
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "light");
+      }
+    })();
+  </script>
+
+  <title>决策辩论助手</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div class="app">
+
+    <!-- ================= 顶部标题栏 ================= -->
+    <header class="header">
+      <div class="header-text">
+        <h1 class="title">决策辩论助手</h1>
+        <p class="subtitle">说出你的想法, 让 AI 帮你找漏洞</p>
+      </div>
+
+      <button id="themeToggle" class="icon-btn" type="button"
+              aria-label="切换明暗主题" aria-pressed="false" title="切换明暗主题">
+        <span class="theme-icon" id="themeIcon" aria-hidden="true">🌙</span>
+      </button>
+
+      <button id="settingsToggle" class="icon-btn" type="button"
+              aria-label="打开设置" aria-haspopup="dialog" title="设置">⚙</button>
+    </header>
+
+    <!-- ================= 控制面板: 统计卡片 + 强度滑块 ================= -->
+    <section class="control-panel" aria-label="辩论控制面板">
+      <div class="stats-card" id="statsCard">
+        <div class="stat">
+          <span class="stat-value" id="roundCount">0</span>
+          <span class="stat-label">辩论回合</span>
+        </div>
+        <span class="stat-divider" aria-hidden="true"></span>
+        <div class="stat">
+          <span class="stat-value" id="msgCount">0</span>
+          <span class="stat-label">我的想法</span>
+        </div>
+        <span class="stat-divider" aria-hidden="true"></span>
+        <div class="stat">
+          <span class="stat-value stat-value-sm" id="strengthValue">普通反驳</span>
+          <span class="stat-label">当前强度</span>
+        </div>
+      </div>
+
+      <div class="strength-card">
+        <div class="strength-head">
+          <span class="strength-title">🎚️ 反驳强度</span>
+          <span class="strength-tip" id="strengthTip">理性平衡, 讲道理也讲风险</span>
+        </div>
+        <input type="range" id="strengthSlider" class="strength-slider"
+               min="0" max="2" step="1" value="1"
+               aria-label="反驳强度" aria-valuetext="普通反驳" />
+        <div class="strength-labels" id="strengthLabels" aria-hidden="true">
+          <span class="strength-label" data-level="0">温和辩论</span>
+          <span class="strength-label" data-level="1">普通反驳</span>
+          <span class="strength-label" data-level="2">强力抬杠</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 宣泄参数面板: 界面隐藏, DOM 保留 ================= -->
+    <section class="vent-panel" id="ventPanel" aria-hidden="true">
+      <div class="vent-head">
+        <span class="vent-title">🫧 情绪宣泄模式</span>
+        <span class="vent-hint">对方在听, 不反驳, 不说教</span>
+      </div>
+
+      <label class="vent-field">
+        <span class="field-label">宣泄对象</span>
+        <input id="ventTarget" class="field-input" type="text" list="ventTargetList"
+               placeholder="填写你想要倾诉的对象" />
+        <datalist id="ventTargetList"></datalist>
+      </label>
+
+      <label class="vent-field">
+        <span class="field-label">角色背景小传</span>
+        <textarea id="ventBio" class="field-input field-textarea" rows="2"
+                  placeholder="补充这个人: 你们是什么关系, 什么性格, 最近发生了什么"></textarea>
+      </label>
+
+      <div class="vent-row">
+        <label class="vent-field vent-field-inline">
+          <span class="field-label">坚韧度</span>
+          <select id="ventResilience" class="field-input field-select">
+            <option value="fragile">脆弱</option>
+            <option value="normal" selected>普通</option>
+            <option value="tough">坚韧</option>
+          </select>
+        </label>
+
+        <div class="vent-progress">
+          <div class="vent-progress-head">
+            <span>对方心态</span>
+            <span id="ventStageLabel">初期 · 安静倾听</span>
+          </div>
+          <div class="vent-bar-wrap" id="ventBarWrap" data-stage="listen">
+            <div class="vent-bar" id="ventBar"></div>
+          </div>
+          <div class="vent-stages"><span>倾听</span><span>动摇</span><span>结局</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =========================================================
+         工具条
+         [恢复] 闪回 / 情绪小结 / 涂鸦 / 换头像 四个按钮改为两种模式都可见,
+                不再挂 debate-only / vent-only, 保证任何时候都能点.
+         ========================================================= -->
+    <div class="tool-strip" id="toolStrip">
+      <button class="tool-chip debate-only" type="button" id="btnTopics">🎲 辩题</button>
+      <button class="tool-chip debate-only" type="button" id="btnRecall">⏱ 回看</button>
+      <button class="tool-chip debate-only" type="button" id="btnSummary">📝 摘要</button>
+      <button class="tool-chip debate-only" type="button" id="btnScore">📊 计分</button>
+
+      <!-- [恢复] 以下四个始终可见 -->
+      <button class="tool-chip" type="button" id="btnFlashback">🕯️ 闪回</button>
+      <button class="tool-chip" type="button" id="btnMood">🫧 情绪小结</button>
+      <button class="tool-chip" type="button" id="btnDraw">🖍️ 涂鸦</button>
+      <button class="tool-chip" type="button" id="btnAvatar">🖼️ 换头像</button>
+    </div>
+
+    <!-- ================= 简易计分板 ================= -->
+    <div class="scoreboard" id="scoreboard" hidden>
+      <div class="score-side">
+        <span class="score-name">我方</span>
+        <button class="score-btn" type="button" data-side="mine" data-delta="-1" aria-label="我方减分">−</button>
+        <span class="score-num" id="scoreMine">0</span>
+        <button class="score-btn" type="button" data-side="mine" data-delta="1" aria-label="我方加分">+</button>
+      </div>
+      <span class="score-vs">VS</span>
+      <div class="score-side">
+        <span class="score-name">对方</span>
+        <button class="score-btn" type="button" data-side="rival" data-delta="-1" aria-label="对方减分">−</button>
+        <span class="score-num" id="scoreRival">0</span>
+        <button class="score-btn" type="button" data-side="rival" data-delta="1" aria-label="对方加分">+</button>
+      </div>
+    </div>
+
+    <!-- ================= 对话区 ================= -->
+    <main class="chat-area" id="chatArea" role="log" aria-live="polite">
+      <div class="message assistant">
+        <div class="avatar">辩</div>
+        <div class="bubble">
+          说吧, 你想做什么决定? 我会站到你的对面, 把这件事可能翻车的地方一个个扯出来.
+        </div>
+      </div>
+    </main>
+
+    <!-- ================= 底部输入区 ================= -->
+    <footer class="input-area">
+      <div class="quick-quotes vent-only" id="quickQuotes"></div>
+
+      <div class="input-row">
+        <textarea
+          id="userInput"
+          class="input-box"
+          rows="1"
+          placeholder="说出你的想法, 我来当反方"
+          aria-label="输入你的想法"
+          enterkeyhint="send"
+        ></textarea>
+      </div>
+
+      <div class="button-row">
+        <button id="clearButton" class="btn btn-secondary" type="button">🗑 清空对话</button>
+        <button id="sendButton" class="btn btn-primary" type="button">提交</button>
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- ================= 设置面板容器 ================= -->
+  <div class="sheet" id="settingsSheet" hidden aria-hidden="true">
+    <div class="sheet-mask" data-close-sheet></div>
+    <div class="sheet-panel" role="dialog" aria-modal="true" aria-label="设置面板">
+      <div class="sheet-head">
+        <strong>⚙ 设置</strong>
+        <button class="icon-btn" type="button" id="settingsClose" aria-label="关闭设置">✕</button>
+      </div>
+      <div class="sheet-body" id="settingsBody"></div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       [恢复] 通用弹窗容器: 闪回 / 情绪小结 / 涂鸦 / 换头像 共用
+       这四个 id (modalTitle, modalBody, modalActions, modalClose) 是 main.js
+       自建弹窗系统必须依赖的结构, 不要删除.
+       ========================================================= -->
+  <div class="modal" id="modalRoot" hidden>
+    <div class="modal-mask" data-close-modal></div>
+    <div class="modal-panel" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <strong id="modalTitle"></strong>
+        <button class="icon-btn" type="button" id="modalClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions" id="modalActions"></div>
+    </div>
+  </div>
+
+  <div class="offline-banner" id="offlineBanner" hidden>
+    📴 当前离线: 只能查看历史记录, 联网后才能发起新对话
+  </div>
+
+  <!-- =========================================================
+       脚本顺序不可调换
+       1 store.js  2 personas.js  3 engine.js  4 panel.js  5 main.js
+       main.js 最后加载, 负责定义 window.DDH 并在缺失 panel.js 时
+       自动装上 DDHPanel 垫片.
+       ========================================================= -->
+  <script src="js/store.js"></script>
+  <script src="js/personas.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/panel.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

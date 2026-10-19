@@ -1,0 +1,35 @@
+{
+  "name": "决策辩论助手 · 陪你辩论与倾诉",
+  "short_name": "辩论助手",
+  "description": "输入你的想法，AI 站在对立面帮你找漏洞；也可以切到情绪宣泄模式，找个人先听你说完。",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "./index.html",
+  "scope": "./",
+  "id": "/decision-debate-helper/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui", "browser"],
+  "orientation": "portrait",
+  "background_color": "#f5f6f8",
+  "theme_color": "#2563eb",
+  "categories": ["education", "lifestyle"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "开始辩论",
+      "short_name": "辩论",
+      "url": "./index.html?mode=debate",
+      "description": "让 AI 站在你的对立面找漏洞"
+    },
+    {
+      "name": "情绪宣泄",
+      "short_name": "倾诉",
+      "url": "./index.html?mode=vent",
+      "description": "先找个人听你说完"
+    }
+  ]
+}
